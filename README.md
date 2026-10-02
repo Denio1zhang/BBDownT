@@ -28,6 +28,10 @@ dotnet tool update --global BBDownT
 
 独立二进制可运行 `BBDownT --update`（改名后如 `bbd --update`）更新到最新正式版。
 
+# 网页版
+
+`serve` 模式自带网页前端，可在浏览器中提交下载、查看进度、扫码登录B站并取回文件。用 Docker 一键部署到服务器的方法见 [DEPLOY.md](./DEPLOY.md)。
+
 # 下载
 Release版本：https://github.com/LOVAHE/BBDownT/releases
 

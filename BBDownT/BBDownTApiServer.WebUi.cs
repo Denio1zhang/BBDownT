@@ -1,0 +1,285 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using BBDownT.Core;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.StaticFiles;
+using QRCoder;
+using static BBDownT.Core.Logger;
+
+namespace BBDownT;
+
+/// <summary>
+/// 服务器模式的网页前端，以及前端用到的会话、文件和B站扫码登录接口
+/// </summary>
+public partial class BBDownTApiServer
+{
+    internal const string SessionCookieName = "bbdownt_token";
+    private const int MaxListedFiles = 5000;
+    private static readonly FileExtensionContentTypeProvider ContentTypeProvider = new();
+    private static readonly Lazy<byte[]> IndexHtml = new(LoadIndexHtml);
+
+    private static byte[] LoadIndexHtml()
+    {
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("BBDownT.WebUi.index.html")
+            ?? throw new InvalidOperationException("缺少内置网页资源");
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        return memory.ToArray();
+    }
+
+    /// <summary>
+    /// 无需API Token即可访问的路径：网页本身和用于提交Token的会话接口
+    /// </summary>
+    internal static bool IsPublicPath(HttpRequest request)
+    {
+        var path = request.Path.Value ?? "";
+        if (HttpMethods.IsGet(request.Method) && path is "/" or "/index.html") return true;
+        return path == "/ui/session" && (HttpMethods.IsPost(request.Method) || HttpMethods.IsDelete(request.Method));
+    }
+
+    private void MapWebUi(WebApplication app)
+    {
+        app.MapGet("/", ServeIndex);
+        app.MapGet("/index.html", ServeIndex);
+
+        app.MapPost("/ui/session", async (HttpContext context) =>
+        {
+            if (!requireApiToken) return Results.Ok();
+            UiSessionRequest? request = null;
+            try
+            {
+                request = await context.Request.ReadFromJsonAsync(AppJsonSerializerContext.Default.UiSessionRequest);
+            }
+            catch { }
+            if (string.IsNullOrWhiteSpace(request?.Token) || !IsApiTokenMatch(request.Token.Trim()))
+            {
+                await Task.Delay(1000);
+                return Results.Text("Token错误", statusCode: StatusCodes.Status401Unauthorized);
+            }
+            context.Response.Cookies.Append(SessionCookieName, apiToken, CreateSessionCookieOptions(context, TimeSpan.FromDays(30)));
+            return Results.Ok();
+        });
+        app.MapDelete("/ui/session", (HttpContext context) =>
+        {
+            context.Response.Cookies.Delete(SessionCookieName, CreateSessionCookieOptions(context, null));
+            return Results.Ok();
+        });
+
+        app.MapGet("/ui/status", async () =>
+        {
+            var ver = Assembly.GetExecutingAssembly().GetName().Version!;
+            var cookieSaved = EnsureWebCookieLoaded();
+            string? userName = null;
+            if (cookieSaved)
+            {
+                try { userName = await BBDownTLoginUtil.GetWebLoginUserNameAsync(); }
+                catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
+            }
+            return Results.Json(
+                new UiStatus($"{ver.Major}.{ver.Minor}.{ver.Build}", requireApiToken, cookieSaved, userName),
+                AppJsonSerializerContext.Default.UiStatus);
+        });
+
+        app.MapPost("/ui/bili-login", async () =>
+        {
+            try
+            {
+                var qrCode = await BBDownTLoginUtil.CreateWebLoginQrCodeAsync();
+                using var qrCodeData = new QRCodeGenerator().CreateQrCode(qrCode.Url, QRCodeGenerator.ECCLevel.Q);
+                var png = new PngByteQRCode(qrCodeData).GetGraphic(8);
+                return Results.Json(
+                    new BiliLoginStart(qrCode.QrcodeKey, "data:image/png;base64," + Convert.ToBase64String(png)),
+                    AppJsonSerializerContext.Default.BiliLoginStart);
+            }
+            catch (Exception e)
+            {
+                return Results.Text($"获取登录二维码失败: {Logger.RedactSensitiveText(e.Message)}", statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
+        app.MapGet("/ui/bili-login/{key}", async (string key) =>
+        {
+            if (!QrcodeKeyRegex().IsMatch(key)) return Results.BadRequest("无效的二维码Key");
+            try
+            {
+                var state = await BBDownTLoginUtil.PollWebLoginAsync(key);
+                string? userName = null;
+                if (state == WebLoginState.Success)
+                {
+                    try { userName = await BBDownTLoginUtil.GetWebLoginUserNameAsync(); }
+                    catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
+                }
+                return Results.Json(
+                    new BiliLoginPoll(state.ToString().ToLowerInvariant(), userName),
+                    AppJsonSerializerContext.Default.BiliLoginPoll);
+            }
+            catch (Exception e)
+            {
+                return Results.Text($"查询登录状态失败: {Logger.RedactSensitiveText(e.Message)}", statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
+        app.MapDelete("/ui/bili-login", () =>
+        {
+            BBDownTLoginUtil.LogoutWEB();
+            return Results.Ok();
+        });
+
+        var filesApi = app.MapGroup("/files");
+        filesApi.MapGet("/", () => Results.Json(ListDownloadedFiles(), AppJsonSerializerContext.Default.ListDownloadedFile));
+        filesApi.MapGet("/download", (HttpContext context) =>
+        {
+            var query = context.Request.Query;
+            string? fullPath = query.ContainsKey("task")
+                ? ResolveTaskFile(query["task"].ToString(), query["index"].ToString())
+                : ResolveDownloadPath(query["path"].ToString());
+            if (fullPath is null || !File.Exists(fullPath)) return Results.NotFound();
+            if (!ContentTypeProvider.TryGetContentType(fullPath, out var contentType))
+            {
+                contentType = "application/octet-stream";
+            }
+            var inline = query["inline"].ToString() == "1";
+            return Results.File(fullPath, contentType, inline ? null : Path.GetFileName(fullPath), enableRangeProcessing: true);
+        });
+        filesApi.MapDelete("/", (HttpContext context) =>
+        {
+            var fullPath = ResolveDownloadPath(context.Request.Query["path"].ToString());
+            if (fullPath is null || !File.Exists(fullPath)) return Results.NotFound();
+            File.Delete(fullPath);
+            RemoveEmptyParentDirectories(fullPath);
+            return Results.Ok();
+        });
+    }
+
+    private static IResult ServeIndex(HttpContext context)
+    {
+        var headers = context.Response.Headers;
+        headers.CacheControl = "no-cache";
+        headers["X-Frame-Options"] = "DENY";
+        headers["X-Content-Type-Options"] = "nosniff";
+        headers["Referrer-Policy"] = "no-referrer";
+        headers.ContentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            + "img-src 'self' data: https://*.hdslb.com; media-src 'self'; connect-src 'self'; frame-ancestors 'none'";
+        return Results.Bytes(IndexHtml.Value, "text/html; charset=utf-8");
+    }
+
+    private static CookieOptions CreateSessionCookieOptions(HttpContext context, TimeSpan? maxAge) => new()
+    {
+        HttpOnly = true,
+        SameSite = SameSiteMode.Strict,
+        Secure = context.Request.IsHttps,
+        Path = "/",
+        MaxAge = maxAge
+    };
+
+    /// <summary>
+    /// 服务器启动后首个任务执行前Cookie尚未加载，这里提前从数据目录读取
+    /// </summary>
+    private static bool EnsureWebCookieLoaded()
+    {
+        if (!string.IsNullOrEmpty(Config.COOKIE)) return true;
+        var cookieFile = Path.Combine(Program.APP_DIR, "BBDownT.data");
+        if (!File.Exists(cookieFile)) return false;
+        Config.COOKIE = File.ReadAllText(cookieFile);
+        AuthenticatedWebProfileStore.Configure(Program.APP_DIR);
+        return !string.IsNullOrEmpty(Config.COOKIE);
+    }
+
+    private string DownloadRootFullPath => Path.GetFullPath(serverOptions.DownloadRoot);
+
+    internal List<DownloadedFile> ListDownloadedFiles()
+    {
+        var root = DownloadRootFullPath;
+        if (!Directory.Exists(root)) return [];
+        var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+        return new DirectoryInfo(root).EnumerateFiles("*", options)
+            .Where(file => !IsProtectedFile(file.FullName))
+            .OrderByDescending(file => file.LastWriteTimeUtc)
+            .Take(MaxListedFiles)
+            .Select(file => new DownloadedFile(
+                Path.GetRelativePath(root, file.FullName).Replace('\\', '/'),
+                file.Length,
+                new DateTimeOffset(file.LastWriteTimeUtc).ToUnixTimeSeconds()))
+            .ToList();
+    }
+
+    /// <summary>
+    /// 将相对下载根目录的路径解析为绝对路径；越出下载根目录或指向配置/登录文件时返回null
+    /// </summary>
+    internal string? ResolveDownloadPath(string? relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath)) return null;
+        var root = DownloadRootFullPath;
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(relativePath, root);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+        var rootWithSeparator = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!fullPath.StartsWith(rootWithSeparator, comparison)) return null;
+        return IsProtectedFile(fullPath) ? null : fullPath;
+    }
+
+    private string? ResolveTaskFile(string taskId, string indexText)
+    {
+        var task = taskStore.FindSnapshot(taskId);
+        if (task is null || !int.TryParse(indexText, out var index) || index < 0 || index >= task.SavePaths.Count)
+        {
+            return null;
+        }
+        // 任务输出路径以下载根目录作为工作目录写入，可能是相对路径
+        return ResolveDownloadPath(Path.GetFullPath(task.SavePaths[index], DownloadRootFullPath));
+    }
+
+    private void RemoveEmptyParentDirectories(string fullPath)
+    {
+        var root = DownloadRootFullPath.TrimEnd(Path.DirectorySeparatorChar);
+        var dir = Path.GetDirectoryName(fullPath);
+        while (!string.IsNullOrEmpty(dir) && dir.Length > root.Length && Directory.Exists(dir)
+               && !Directory.EnumerateFileSystemEntries(dir).Any())
+        {
+            Directory.Delete(dir);
+            dir = Path.GetDirectoryName(dir);
+        }
+    }
+
+    /// <summary>
+    /// 下载根目录与程序目录相同时，避免通过文件接口读取或删除登录、配置和归档文件
+    /// </summary>
+    internal static bool IsProtectedFile(string fullPath)
+    {
+        var dir = Path.GetDirectoryName(fullPath);
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!string.Equals(dir, Program.APP_DIR, comparison) && !string.Equals(dir, Program.EXE_DIR, comparison))
+        {
+            return false;
+        }
+        return ProtectedFileNameRegex().IsMatch(Path.GetFileName(fullPath));
+    }
+
+    [GeneratedRegex(@"^BBDownT?(TV|App)?\.(data|config|archives|web\.json)$", RegexOptions.IgnoreCase)]
+    private static partial Regex ProtectedFileNameRegex();
+
+    [GeneratedRegex("^[A-Za-z0-9]{1,64}$")]
+    private static partial Regex QrcodeKeyRegex();
+}
+
+public sealed record UiSessionRequest(string? Token);
+
+public sealed record UiStatus(string Version, bool AuthRequired, bool BiliCookieSaved, string? BiliUserName);
+
+public sealed record BiliLoginStart(string Key, string QrCode);
+
+public sealed record BiliLoginPoll(string State, string? UserName);
+
+public sealed record DownloadedFile(string Path, long Size, long ModifiedTime);

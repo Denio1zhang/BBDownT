@@ -18,7 +18,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 namespace BBDownT;
 
-public class BBDownTApiServer
+public partial class BBDownTApiServer
 {
     private WebApplication? app;
     private readonly DownloadTaskStore taskStore = new();
@@ -28,6 +28,15 @@ public class BBDownTApiServer
     private BBDownTServerOptions serverOptions = new();
     private string apiToken = "";
     private bool requireApiToken;
+
+    public BBDownTApiServer()
+    {
+    }
+
+    internal BBDownTApiServer(BBDownTServerOptions options)
+    {
+        serverOptions = options;
+    }
 
     public void SetUpServer(BBDownTServerOptions? options = null)
     {
@@ -52,7 +61,7 @@ public class BBDownTApiServer
         app.UseCors("AllowAnyOrigin");
         app.Use(async (context, next) =>
         {
-            if (!HasValidApiToken(context))
+            if (!IsPublicPath(context.Request) && !HasValidApiToken(context))
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 await context.Response.WriteAsync("Unauthorized");
@@ -60,6 +69,7 @@ public class BBDownTApiServer
             }
             await next();
         });
+        MapWebUi(app);
         var taskStatusApi = app.MapGroup("/get-tasks");
         taskStatusApi.MapGet("/", handler: () => Results.Json(taskStore.GetSnapshot(), AppJsonSerializerContext.Default.DownloadTaskCollection));
         taskStatusApi.MapGet("/running", handler: () => Results.Json(taskStore.GetRunningSnapshot(), AppJsonSerializerContext.Default.ListDownloadTask));
@@ -419,8 +429,15 @@ public class BBDownTApiServer
             }
         }
 
-        return context.Request.Headers.TryGetValue("X-BBDownT-Token", out var token)
-            && IsApiTokenMatch(token.ToString().Trim());
+        if (context.Request.Headers.TryGetValue("X-BBDownT-Token", out var token)
+            && IsApiTokenMatch(token.ToString().Trim()))
+        {
+            return true;
+        }
+
+        // 网页前端登录后使用HttpOnly Cookie携带Token
+        return context.Request.Cookies.TryGetValue(SessionCookieName, out var sessionToken)
+            && IsApiTokenMatch(sessionToken);
     }
 
     private bool IsApiTokenMatch(string candidate)

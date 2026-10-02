@@ -9,6 +9,7 @@ using System.Text.Json;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Linq;
+using BBDownT.Core;
 using BBDownT.Core.Util;
 
 namespace BBDownT;
@@ -31,21 +32,72 @@ internal static class BBDownTLoginUtil
         return new LoginStatusResult(responseBody, setCookieHeaders);
     }
 
+    public static async Task<WebLoginQrCode> CreateWebLoginQrCodeAsync()
+    {
+        AuthenticatedWebProfileStore.Configure(Program.APP_DIR);
+        string loginUrl = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate?source=main-fe-header";
+        string url = JsonDocument.Parse(await HTTPUtil.GetAuthenticatedWebSourceAsync(loginUrl)).RootElement.GetProperty("data").GetProperty("url").ToString();
+        return new WebLoginQrCode(url, GetQueryString("qrcode_key", url));
+    }
+
+    /// <summary>
+    /// 查询一次扫码状态；登录成功时保存Cookie并立即在当前进程生效
+    /// </summary>
+    public static async Task<WebLoginState> PollWebLoginAsync(string qrcodeKey)
+    {
+        var loginStatus = await GetLoginStatusAsync(qrcodeKey);
+        using var loginDoc = JsonDocument.Parse(loginStatus.ResponseBody);
+        var loginData = loginDoc.RootElement.GetProperty("data");
+        int code = loginData.GetProperty("code").GetInt32();
+        switch (code)
+        {
+            case 86038: return WebLoginState.Expired;
+            case 86101: return WebLoginState.Waiting; //等待扫码
+            case 86090: return WebLoginState.Scanned; //等待确认
+        }
+
+        string cc = loginData.GetProperty("url").ToString();
+        string? refreshToken = loginData.TryGetProperty("refresh_token", out var refreshTokenElement)
+            ? refreshTokenElement.GetString()
+            : null;
+        var cookie = BBDownTCookieRefreshUtil.NormalizeLoginCookie(cc, refreshToken, loginStatus.SetCookieHeaders);
+        if (!BBDownTCookieRefreshUtil.HasRequiredLoginCookies(cookie))
+        {
+            throw new InvalidOperationException("登录响应缺少SESSDATA或bili_jct，未覆盖现有Cookie文件。");
+        }
+
+        await File.WriteAllTextAsync(Path.Combine(Program.APP_DIR, "BBDownT.data"), cookie);
+        Config.COOKIE = cookie;
+        return WebLoginState.Success;
+    }
+
+    /// <summary>
+    /// 返回当前WEB登录账号的昵称，未登录时返回null
+    /// </summary>
+    public static async Task<string?> GetWebLoginUserNameAsync()
+    {
+        if (string.IsNullOrEmpty(Config.COOKIE)) return null;
+        var source = await HTTPUtil.GetWebSourceAsync("https://api.bilibili.com/x/web-interface/nav");
+        var data = JsonDocument.Parse(source).RootElement.GetProperty("data");
+        return data.GetProperty("isLogin").GetBoolean() ? data.GetProperty("uname").GetString() : null;
+    }
+
+    public static void LogoutWEB()
+    {
+        File.Delete(Path.Combine(Program.APP_DIR, "BBDownT.data"));
+        Config.COOKIE = "";
+    }
+
     public static async Task LoginWEB()
     {
         try
         {
-            AuthenticatedWebProfileStore.Configure(Program.APP_DIR);
             Log("获取登录地址...");
-            string loginUrl = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate?source=main-fe-header";
-            string url = JsonDocument.Parse(await HTTPUtil.GetAuthenticatedWebSourceAsync(loginUrl)).RootElement.GetProperty("data").GetProperty("url").ToString();
-            string qrcodeKey = GetQueryString("qrcode_key", url);
-            //Log(oauthKey);
-            //Log(url);
+            var qrCode = await CreateWebLoginQrCodeAsync();
             bool flag = false;
             Log("生成二维码...");
             QRCodeGenerator qrGenerator = new();
-            QRCodeData qrCodeData = qrGenerator.CreateQrCode(url, QRCodeGenerator.ECCLevel.Q);
+            QRCodeData qrCodeData = qrGenerator.CreateQrCode(qrCode.Url, QRCodeGenerator.ECCLevel.Q);
             PngByteQRCode pngByteCode = new(qrCodeData);
             await File.WriteAllBytesAsync("qrcode.png", pngByteCode.GetGraphic(7));
             Log("生成二维码成功: qrcode.png, 请打开并扫描, 或扫描打印的二维码");
@@ -55,19 +107,13 @@ internal static class BBDownTLoginUtil
             while (true)
             {
                 await Task.Delay(1000);
-                var loginStatus = await GetLoginStatusAsync(qrcodeKey);
-                string w = loginStatus.ResponseBody;
-                int code = JsonDocument.Parse(w).RootElement.GetProperty("data").GetProperty("code").GetInt32();
-                if (code == 86038)
+                var state = await PollWebLoginAsync(qrCode.QrcodeKey);
+                if (state == WebLoginState.Expired)
                 {
                     LogColor("二维码已过期, 请重新执行登录指令.");
                     break;
                 }
-                else if (code == 86101) //等待扫码
-                {
-                    continue;
-                }
-                else if (code == 86090) //等待确认
+                else if (state == WebLoginState.Scanned)
                 {
                     if (!flag)
                     {
@@ -75,22 +121,9 @@ internal static class BBDownTLoginUtil
                         flag = !flag;
                     }
                 }
-                else
+                else if (state == WebLoginState.Success)
                 {
-                    using var loginDoc = JsonDocument.Parse(w);
-                    var loginData = loginDoc.RootElement.GetProperty("data");
-                    string cc = loginData.GetProperty("url").ToString();
-                    string? refreshToken = loginData.TryGetProperty("refresh_token", out var refreshTokenElement)
-                        ? refreshTokenElement.GetString()
-                        : null;
                     Log("登录成功");
-                    var cookie = BBDownTCookieRefreshUtil.NormalizeLoginCookie(cc, refreshToken, loginStatus.SetCookieHeaders);
-                    if (!BBDownTCookieRefreshUtil.HasRequiredLoginCookies(cookie))
-                    {
-                        throw new InvalidOperationException("登录响应缺少SESSDATA或bili_jct，未覆盖现有Cookie文件。");
-                    }
-
-                    await File.WriteAllTextAsync(Path.Combine(Program.APP_DIR, "BBDownT.data"), cookie);
                     File.Delete("qrcode.png");
                     break;
                 }
@@ -154,3 +187,7 @@ internal static class BBDownTLoginUtil
 
     private readonly record struct LoginStatusResult(string ResponseBody, string[] SetCookieHeaders);
 }
+
+internal enum WebLoginState { Waiting, Scanned, Expired, Success }
+
+internal sealed record WebLoginQrCode(string Url, string QrcodeKey);
