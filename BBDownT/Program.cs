@@ -30,7 +30,19 @@ partial class Program
     public static string SinglePageDefaultSavePath { get; set; } = "<videoTitle>";
     public static string MultiPageDefaultSavePath { get; set; } = "<videoTitle>/[P<pageNumberWithZero>]<pageTitle>";
 
-    public static readonly string APP_DIR = Path.GetDirectoryName(Environment.ProcessPath)!;
+    public static readonly string EXE_DIR = Path.GetDirectoryName(Environment.ProcessPath)!;
+    /// <summary>
+    /// 配置、登录信息和归档文件所在目录；可通过环境变量 BBDOWNT_DATA_DIR 指定(如Docker数据卷)
+    /// </summary>
+    public static readonly string APP_DIR = ResolveAppDir(Environment.GetEnvironmentVariable("BBDOWNT_DATA_DIR"), EXE_DIR);
+
+    internal static string ResolveAppDir(string? dataDir, string exeDir)
+    {
+        if (string.IsNullOrWhiteSpace(dataDir)) return exeDir;
+        var fullPath = Path.GetFullPath(dataDir);
+        Directory.CreateDirectory(fullPath);
+        return fullPath;
+    }
 
     private static string FormatTimeStamp(long ts, string format)
     {
@@ -334,7 +346,7 @@ partial class Program
         _ = CheckUpdateAsync();
         var server = new BBDownTApiServer();
         server.SetUpServer(serverOptions);
-        server.Run(actualListenUrl, apiToken);
+        server.Run(actualListenUrl, string.IsNullOrWhiteSpace(apiToken) ? Environment.GetEnvironmentVariable("BBDOWNT_API_TOKEN") : apiToken);
     }
 
     private static void ApplyServeSecurityOptions(bool allowInsecureTls, string? cookieAllowedDomains, int maxGrpcMessageMb)

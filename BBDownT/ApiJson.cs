@@ -42,6 +42,11 @@ record struct MyOptionBindingResult<T>(T? Result, Exception? Exception)
 [JsonSerializable(typeof(List<DownloadTask>))]
 [JsonSerializable(typeof(DownloadTaskCollection))]
 [JsonSerializable(typeof(TaskSubmissionResult))]
+[JsonSerializable(typeof(UiSessionRequest))]
+[JsonSerializable(typeof(UiStatus))]
+[JsonSerializable(typeof(BiliLoginStart))]
+[JsonSerializable(typeof(BiliLoginPoll))]
+[JsonSerializable(typeof(List<DownloadedFile>))]
 public partial class AppJsonSerializerContext : JsonSerializerContext
 {
 

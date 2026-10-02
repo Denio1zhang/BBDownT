@@ -178,6 +178,30 @@ DELETE /remove-finished/{id}
 | 参数 | `{id}`：TaskId或视频AID |
 | 返回 | 无论是否能找到对应ID的任务，均返回200 OK |
 
+### 网页前端相关接口
+
+服务器根路径 `/` 提供网页前端，部署方法见 [DEPLOY.md](./DEPLOY.md)。网页使用以下接口：
+
+| 接口 | 说明 |
+| ---- | ---- |
+| `POST /ui/session` | Body `{ "Token": "..." }`，校验成功后写入 HttpOnly Cookie，之后的请求可用该Cookie代替请求头鉴权；无需鉴权 |
+| `DELETE /ui/session` | 清除上述Cookie；无需鉴权 |
+| `GET /ui/status` | 返回版本、是否需要鉴权、B站登录状态和昵称 |
+| `POST /ui/bili-login` | 生成B站扫码登录二维码，返回 `{ "Key": "...", "QrCode": "data:image/png;base64,..." }` |
+| `GET /ui/bili-login/{key}` | 查询扫码状态，`State` 为 `waiting`/`scanned`/`expired`/`success`；成功后Cookie保存到数据目录并立即生效 |
+| `DELETE /ui/bili-login` | 退出B站账号（删除保存的Cookie） |
+| `GET /files/` | 列出下载根目录下的文件（相对路径、大小、修改时间） |
+| `GET /files/download?path=<相对路径>` | 下载文件，支持断点续传；加 `&inline=1` 可在浏览器中直接播放 |
+| `GET /files/download?task=<TaskId>&index=<序号>` | 下载任务 `SavePaths` 中的第N个文件 |
+| `DELETE /files/?path=<相对路径>` | 删除文件 |
+
+文件接口只能访问下载根目录内的文件，并且不会返回数据目录中的登录和配置文件。
+
+环境变量：
+
+- `BBDOWNT_API_TOKEN`：未通过 `--api-token` 或配置文件指定时，使用此值作为API Token。
+- `BBDOWNT_DATA_DIR`：登录信息、配置文件和下载归档的保存目录，默认为程序所在目录。
+
 ## 服务器配置
 
 以下选项只在`serve`模式下使用，也可以写入`BBDownT.config`：
