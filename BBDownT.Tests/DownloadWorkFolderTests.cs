@@ -169,16 +169,29 @@ public class DownloadWorkFolderTests : IDisposable
     }
 
     [Fact]
-    public void StagedFileCountsAsPendingWork()
+    public void FinishedPageDeletesStagedFilesLeftByACrashedMerge()
     {
-        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "合并时中断" });
-        var staged = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
-        File.WriteAllText(staged, "half a track");
+        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "合并时崩溃过" });
+        var stale = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
+        File.WriteAllText(stale, "half a track");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-1));
 
         Program.DeleteEmptyDownloadDirectory(folder);
 
-        // 说明文件留着，「已下载文件」仍显示为未完成的下载，删除整组时一并删除暂存文件
-        Assert.True(File.Exists(staged));
+        Assert.False(Directory.Exists(folder));
+    }
+
+    [Fact]
+    public void RecentStagedFileCountsAsPendingWork()
+    {
+        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "刚中断" });
+        var recent = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
+        File.WriteAllText(recent, "half a track");
+
+        Program.DeleteEmptyDownloadDirectory(folder);
+
+        // 不到两分钟、可能还在写入的暂存文件不删；说明文件留着，「已下载文件」仍显示为未完成的下载
+        Assert.True(File.Exists(recent));
         Assert.True(File.Exists(MetadataPath));
     }
 

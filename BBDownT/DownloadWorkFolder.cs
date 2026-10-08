@@ -90,7 +90,8 @@ internal static partial class DownloadWorkFolder
 
     /// <summary>
     /// 未完成的下载留下的文件：分片、单线程下载的 .tmp 临时文件(含校验用的 .verify.tmp)及它们的 .resume 续传状态。
-    /// 合并好的轨道旁的 &lt;轨道&gt;.resume 不算：混流后随轨道一起删除，只下载不混流(SkipMux)时它和轨道就是输出
+    /// 合并好的轨道旁的 &lt;轨道&gt;.resume 不算：混流后随轨道一起删除，只下载不混流(SkipMux)时它和轨道就是输出；
+    /// 混流失败留下的轨道因此也不算未完成，同一文件夹里别的分P完成时说明文件照常删除
     /// </summary>
     internal static bool IsPendingFile(string fileName)
     {
@@ -270,14 +271,23 @@ internal static partial class DownloadWorkFolder
     }
 
     /// <summary>
-    /// 一个分P结束时：文件夹里不再有未完成的工作(<see cref="HasPendingWork"/>)时删除说明文件。
-    /// 文件夹是否删除由调用方在之后判断(为空才删)
+    /// 合并分片时崩溃留下的暂存文件超过这么久没有变化就不是正在写入的
+    /// </summary>
+    private static readonly TimeSpan StaleStagedAge = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// 一个分P结束时：先删除合并分片时崩溃留下的旧暂存文件(没法续传，重跑时从分片重新合并)，
+    /// 文件夹里不再有未完成的工作(<see cref="HasPendingWork"/>)时删除说明文件。文件夹是否删除由调用方在之后判断(为空才删)
     /// </summary>
     internal static void CleanUp(string folder)
     {
         try
         {
-            if (Directory.Exists(folder) && !HasPendingWork(folder)) File.Delete(MetadataPath(folder));
+            if (!Directory.Exists(folder)) return;
+            foreach (var file in Directory.EnumerateFiles(folder).Where(file => TryParseStagedName(Path.GetFileName(file), out _)
+                && DateTime.UtcNow - File.GetLastWriteTimeUtc(file) > StaleStagedAge).ToList())
+                File.Delete(file);
+            if (!HasPendingWork(folder)) File.Delete(MetadataPath(folder));
         }
         catch (Exception e)
         {
