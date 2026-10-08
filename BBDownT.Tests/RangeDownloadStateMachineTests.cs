@@ -79,6 +79,39 @@ public class RangeDownloadStateMachineTests
     }
 
     [Fact]
+    public async Task BoundedClip_ChangedEntityDuringResumeRestartsTheClipInsteadOfFailing()
+    {
+        var path = Path.GetTempFileName();
+        await File.WriteAllBytesAsync(path, [9, 9]);
+        await new DownloadResumeValidator("\"entity-v1\"", null).SaveAsync(path + ".resume");
+        var requests = new List<string>();
+        try
+        {
+            using var client = CreateClient(request =>
+            {
+                requests.Add($"{request.Headers.Range} {request.Headers.IfRange}".Trim());
+                // If-Range 不匹配：服务器返回整个文件
+                return request.Headers.IfRange is not null
+                    ? CreateResponse(HttpStatusCode.OK, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6], entityTag: "\"entity-v2\"")
+                    : CreateResponse(HttpStatusCode.PartialContent, [1, 2, 3, 4], 10, 13, 16, entityTag: "\"entity-v2\"");
+            });
+
+            await BBDownTDownloadUtil.RangeDownloadToTmpAsync(
+                0, "https://example.test/media", path, 10, 13, (_, _, _) => { }, true, client,
+                new BBDownTDownloadUtil.ClipResumeOptions { KeepValidator = true });
+
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, await File.ReadAllBytesAsync(path));
+            Assert.Equal(["bytes=12-13 \"entity-v1\"", "bytes=10-13"], requests);
+            Assert.Equal(new DownloadResumeValidator("\"entity-v2\"", null, 16), await DownloadResumeValidator.LoadAsync(path + ".resume"));
+        }
+        finally
+        {
+            File.Delete(path);
+            File.Delete(path + ".resume");
+        }
+    }
+
+    [Fact]
     public async Task CompleteTemporaryFile_IsAcceptedWhenRangeReturnsMatchingEof()
     {
         var path = Path.GetTempFileName();

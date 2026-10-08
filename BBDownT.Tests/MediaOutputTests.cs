@@ -3,6 +3,40 @@ namespace BBDownT.Tests;
 public class MediaOutputTests
 {
     [Theory]
+    [InlineData(".10.P1.20.0123456789abcdef0123456789abcdef.partial.mp4", true, "10.P1.20.mp4")]
+    [InlineData(".[P01]开场.0123456789abcdef0123456789abcdef.partial.mkv", true, "[P01]开场.mkv")]
+    [InlineData(".chapters.0123456789abcdef0123456789abcdef.partial", true, "chapters")]
+    [InlineData("other.partial.mp4", false, "")]
+    [InlineData(".x.0123.partial.mp4", false, "")]
+    public void StagedNames(string name, bool staged, string original)
+    {
+        Assert.Equal(staged, MediaOutput.TryParseStagedName(name, out var parsed));
+        Assert.Equal(original, parsed);
+    }
+
+    [Fact]
+    public void WriteRemovesStagedFilesThatAnEarlierCrashLeftForTheSameDestination()
+    {
+        using var files = new MediaTestDirectory();
+        var destination = files.FilePath("result.mp4");
+        var stale = files.Write(".result.0123456789abcdef0123456789abcdef.partial.mp4", "crashed");
+        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-1));
+        var recent = files.Write(".result.fedcba9876543210fedcba9876543210.partial.mp4", "being written by someone else");
+        var otherStale = files.Write(".other.0123456789abcdef0123456789abcdef.partial.mp4", "another file");
+        File.SetLastWriteTimeUtc(otherStale, DateTime.UtcNow.AddHours(-1));
+
+        Assert.True(MediaOutput.Write(destination, path =>
+        {
+            File.WriteAllText(path, "media");
+            return 0;
+        }));
+
+        Assert.False(File.Exists(stale));
+        Assert.True(File.Exists(recent));
+        Assert.True(File.Exists(otherStale));
+    }
+
+    [Theory]
     [InlineData("result.mp4")]
     [InlineData("音频 sample.m4a")]
     public void SuccessPublishesOnlyAfterWriterCompletes(string name)

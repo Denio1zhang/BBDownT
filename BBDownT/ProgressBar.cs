@@ -59,7 +59,25 @@ class ProgressBar : IDisposable, IProgress<double>
 	{
 		value = NormalizeProgress(value);
 		Interlocked.Exchange(ref currentProgress, value);
-		Interlocked.Exchange(ref downloadedBytes, bytesCount);
+		// 多线程下载时各分段线程并发上报累计字节数，较早算出的较小值可能后写入；只保留最大值，避免少计
+		long current;
+		do
+		{
+			current = Interlocked.Read(ref downloadedBytes);
+			if (bytesCount <= current) break;
+		} while (Interlocked.CompareExchange(ref downloadedBytes, bytesCount, current) != current);
+	}
+
+	/// <summary>
+	/// 续传时沿用的已有字节：仍计入进度(随后的 Report 会包含它们)，但不算作本次的下载速度和下载量
+	/// </summary>
+	public void ReportReused(long bytes)
+	{
+		if (bytes <= 0) return;
+		lock (speedTimer)
+		{
+			lastDownloadedBytes += bytes;
+		}
 	}
 
 	internal static double NormalizeProgress(double value)
@@ -157,6 +175,16 @@ class ProgressBar : IDisposable, IProgress<double>
 		{
 			disposed = true;
 			UpdateText(string.Empty);
+		}
+		// 不足一个测速周期(1秒)的剩余字节也计入任务的已下载量：小文件常常在第一次测速之前就下载完了
+		lock (speedTimer)
+		{
+			var delta = Interlocked.Read(ref downloadedBytes) - lastDownloadedBytes;
+			if (delta > 0)
+			{
+				lastDownloadedBytes += delta;
+				RelatedTask?.AddDownloadedBytes(delta);
+			}
 		}
 	}
 }

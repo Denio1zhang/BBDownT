@@ -162,11 +162,14 @@ partial class Program
         var maxGrpcMessageMbOpt = new Option<int>(
             ["--max-grpc-message-mb"],
             description: "gRPC响应最大解压大小(MiB)，默认64");
+        var serverAllowedHostsOpt = new Option<string>(
+            ["--server-allowed-hosts"],
+            description: "未启用API Token时，除本机地址外还允许用来访问服务器的域名，用逗号分隔(如本机反向代理保留了原始Host)");
         rootCommand.AddGlobalOption(serverTokenOpt);
         Command runAsServerCommand = new(
                 "serve",
                 "以服务器模式运行")
-            { serverUrlOpt, serverAllowAria2cArgsOpt, serverAllowCustomOutputOpt, serverAllowCustomNetworkHostsOpt, serverAllowPrivateCallbacksOpt, serverDownloadRootOpt, serverMaxQueueOpt, serverMaxFinishedOpt, serverFinishedRetentionHoursOpt, allowInsecureTlsOpt, cookieAllowedDomainsOpt, maxGrpcMessageMbOpt };
+            { serverUrlOpt, serverAllowAria2cArgsOpt, serverAllowCustomOutputOpt, serverAllowCustomNetworkHostsOpt, serverAllowPrivateCallbacksOpt, serverDownloadRootOpt, serverMaxQueueOpt, serverMaxFinishedOpt, serverFinishedRetentionHoursOpt, allowInsecureTlsOpt, cookieAllowedDomainsOpt, maxGrpcMessageMbOpt, serverAllowedHostsOpt };
         runAsServerCommand.SetHandler(context => StartServer(
             context.ParseResult.GetValueForOption(serverUrlOpt),
             context.ParseResult.GetValueForOption(serverTokenOpt),
@@ -180,7 +183,8 @@ partial class Program
             context.ParseResult.GetValueForOption(serverFinishedRetentionHoursOpt),
             context.ParseResult.GetValueForOption(allowInsecureTlsOpt),
             context.ParseResult.GetValueForOption(cookieAllowedDomainsOpt),
-            context.ParseResult.GetValueForOption(maxGrpcMessageMbOpt)));
+            context.ParseResult.GetValueForOption(maxGrpcMessageMbOpt),
+            context.ParseResult.GetValueForOption(serverAllowedHostsOpt)));
         rootCommand.AddCommand(runAsServerCommand);
         rootCommand.Description = "BBDownT是一个免费且便捷高效的哔哩哔哩下载/解析软件.";
         rootCommand.TreatUnmatchedTokensAsErrors = true;
@@ -326,7 +330,8 @@ partial class Program
         int finishedRetentionHours,
         bool allowInsecureTls,
         string? cookieAllowedDomains,
-        int maxGrpcMessageMb)
+        int maxGrpcMessageMb,
+        string? allowedHosts)
     {
         var defaultListenUrl = "http://127.0.0.1:23333";
         var actualListenUrl = string.IsNullOrEmpty(listenUrl) ? defaultListenUrl : listenUrl;
@@ -340,7 +345,8 @@ partial class Program
             DownloadRoot = string.IsNullOrWhiteSpace(downloadRoot) ? Environment.CurrentDirectory : downloadRoot,
             MaxQueueLength = maxQueueLength > 0 ? maxQueueLength : 100,
             MaxFinishedTasks = maxFinishedTasks > 0 ? maxFinishedTasks : 1000,
-            FinishedTaskRetentionSeconds = (finishedRetentionHours > 0 ? finishedRetentionHours : 24) * 60L * 60L
+            FinishedTaskRetentionSeconds = (finishedRetentionHours > 0 ? finishedRetentionHours : 24) * 60L * 60L,
+            AllowedHosts = BBDownTApiServer.ParseAllowedHosts(allowedHosts)
         };
         //检测更新
         _ = CheckUpdateAsync();
@@ -372,6 +378,8 @@ partial class Program
             throw new ArgumentException(subtitleError);
         if (AudioLanguageSelection.ValidateOptions(myOption) is { } audioError)
             throw new ArgumentException(audioError);
+        if (StreamPinSelection.ValidateOptions(myOption) is { } streamError)
+            throw new ArgumentException(streamError);
 
         //处理废弃选项
         HandleDeprecatedOptions(myOption);
@@ -449,16 +457,17 @@ partial class Program
         // 加载认证信息
         string? webCookieFilePath = LoadCredentials(myOption);
         await BBDownTCookieRefreshUtil.TryRefreshCookieAsync(webCookieFilePath);
+        if (MissingApiTokenWarning(myOption, Config.TOKEN) is { } tokenWarning) LogWarn(tokenWarning);
 
-        // 检测是否登录了账号
+        // 检测是否登录了账号；同时获取WEB签名所需的WBI key，所以APP模式下也要执行
         if (myOption is { UseIntlApi: false, UseTvApi: false } && Config.AREA == "")
         {
             if (BBDownTCookieRefreshUtil.IsMissingBiliJct(Config.COOKIE))
                 LogWarn("当前Cookie缺少bili_jct，部分请求可能被拒绝；请重新执行 BBDownT login 或在 -c 中补全Cookie。将继续尝试下载。");
-            Log("检测账号登录...");
+            Log(LoginCheckMessage(myOption));
             if (!await CheckLogin(Config.COOKIE))
             {
-                LogWarn("你尚未登录B站账号, 解析可能受到限制");
+                LogWarn(myOption.UseAppApi ? "你尚未登录B站网页账号, 字幕等网页接口可能受到限制" : "你尚未登录B站账号, 解析可能受到限制");
             }
         }
 
@@ -471,6 +480,33 @@ partial class Program
             throw new Exception("输入有误");
         }
 
+        return await FetchVideoInfoAsync(myOption, aidOri);
+    }
+
+    /// <summary>
+    /// APP/TV接口只使用access_token，网页扫码登录的Cookie对它们无效。
+    /// 两个接口未登录时的限制不同：APP通常最高480P且只返回一种编码；TV拿不到1080P及以上画质(实测游客最高720P)。
+    /// </summary>
+    internal static string? MissingApiTokenWarning(MyOption myOption, string token)
+    {
+        if (!string.IsNullOrEmpty(token) || !(myOption.UseAppApi || myOption.UseTvApi)) return null;
+        return myOption.UseTvApi
+            ? "当前使用TV接口，但没有TV端登录凭证(access_token)，网页扫码登录对TV接口无效，将按未登录身份解析：拿不到 1080P 及以上画质（未登录通常最高 720P）。需要高画质请改用WEB接口，或执行 BBDownT logintv 登录TV端。"
+            : "当前使用APP接口，但没有APP端登录凭证(access_token)，网页扫码登录对APP接口无效，将按未登录身份解析：通常最高 480P，且一次只返回一种编码。需要高画质请改用WEB接口。";
+    }
+
+    /// <summary>
+    /// APP模式下仍会检查网页登录(WBI签名、字幕等网页接口要用)，但要说明APP接口本身不使用网页登录，
+    /// 避免日志看起来像已按登录身份解析
+    /// </summary>
+    internal static string LoginCheckMessage(MyOption myOption) =>
+        myOption.UseAppApi ? "检测网页账号登录(仅供网页接口使用；APP接口只认access_token，不使用网页登录)..." : "检测账号登录...";
+
+    /// <summary>
+    /// 根据aid获取视频信息与分P列表；不加载或改写登录凭证
+    /// </summary>
+    internal static async Task<(string fetchedAid, VInfo vInfo, string apiType)> FetchVideoInfoAsync(MyOption myOption, string aidOri)
+    {
         Log("获取视频信息...");
         IFetcher fetcher = FetcherFactory.CreateFetcher(aidOri, myOption.UseIntlApi);
         VInfo? vInfo = null;
@@ -562,9 +598,18 @@ partial class Program
         var useAidArchive = AudioLanguageSelection.UseAidArchive(myOption);
         if (myOption.SaveArchivesToFile && !useAidArchive)
             Log("已选择配音版本，不读写默认配音的下载归档；常规混流模式按带语言后缀的输出文件检查是否已下载。");
+        // 下载期间登记要用到的临时工作文件夹(<aid>/)：「已下载文件」据此判断哪个未完成的下载正在进行，不能删除
+        using var activeFolders = myOption.OnlyShowInfo ? null : DownloadWorkFolder.MarkActive(plan.Pages.Select(page => page.aid));
         await runner.RunAsync(plan.Pages, useAidArchive, delay,
-            page => DownloadPageAsync(page, myOption, vInfo, plan.Pages, encodingPriority, dfnPriority, firstEncoding,
-                downloadDanmaku, downloadDanmakuFormats, input, plan.SavePathFormat, lang, aidOri, apiType, relatedTask),
+            async page =>
+            {
+                var outcome = await DownloadPageAsync(page, myOption, vInfo, plan.Pages, encodingPriority, dfnPriority, firstEncoding,
+                    downloadDanmaku, downloadDanmakuFormats, input, plan.SavePathFormat, lang, aidOri, apiType, relatedTask);
+                // 下载历史只记实际下载完成(含已存在而跳过)的分P
+                if (outcome.IsSuccessful() && outcome != DownloadPageOutcome.InfoOnly)
+                    relatedTask?.AddPage(page.index, page.title, alreadyExisted: outcome == DownloadPageOutcome.AlreadyExists);
+                return outcome;
+            },
             vInfo.PagesInfo);
     }
 
@@ -632,6 +677,7 @@ partial class Program
                 {
                     Directory.CreateDirectory(p.aid);
                 }
+                BeginWorkFolder(p.aid, myOption, vInfo, p, pic, apiType, relatedTask);
                 if (!myOption.SkipCover && !myOption.SubOnly && !File.Exists(coverPath) && !myOption.DanmakuOnly && !myOption.CoverOnly)
                 {
                     await DownloadFileAsync(pic == "" ? p.cover! : pic, coverPath, new DownloadConfig());
@@ -712,6 +758,11 @@ partial class Program
                 foreach (var role in parsedResult.RoleAudioList)
                 {
                     role.audio = SortTracks(role.audio, encodingPriority, myOption.AudioAscending);
+                }
+                //按解析预览精确指定的流
+                foreach (var miss in StreamPinSelection.Apply(myOption, parsedResult))
+                {
+                    LogWarn($"P{p.index}: {miss}");
                 }
 
                 //打印轨道信息
@@ -811,6 +862,8 @@ partial class Program
 
                 Log($"已选择的流:");
                 PrintSelectedTrackInfo(selectedVideo, selectedAudio, p.dur);
+                relatedTask?.SetStream($"{p.aid}/{p.cid}/{p.index}", DescribeSelectedStreams(p, apiType, selectedVideo, selectedAudio),
+                    StreamTags(selectedVideo, selectedAudio));
 
                 //用户开启了强制替换
                 if (myOption.ForceReplaceHost && string.IsNullOrEmpty(myOption.UposHost))
@@ -874,6 +927,7 @@ partial class Program
                     RecordDownloadedStreams(
                         relatedTask,
                         [videoPath, audioPath, .. audioMaterial.Select(material => material.path)]);
+                    DownloadWorkFolder.FinishTracks(p.aid, [videoPath, audioPath, .. audioMaterial.Select(material => material.path)]);
                     return DownloadPageOutcome.Partial;
                 }
                 Log($"开始合并音视频{(subtitleInfo.Any() ? "和字幕" : "")}...");
@@ -965,6 +1019,7 @@ partial class Program
                 if (myOption.SkipMux)
                 {
                     RecordDownloadedStreams(relatedTask, videoPath);
+                    DownloadWorkFolder.FinishTracks(p.aid, videoPath);
                     return DownloadPageOutcome.Partial;
                 }
                 Log($"开始混流视频{(subtitleInfo.Any() ? "和字幕" : "")}...");
@@ -1115,12 +1170,36 @@ partial class Program
                 .ToList();
     }
 
-    private static List<Audio> SortTracks(List<Audio> audioTracks, Dictionary<string, byte> encodingPriority, bool audioAscending)
+    internal static List<Audio> SortTracks(List<Audio> audioTracks, Dictionary<string, byte> encodingPriority, bool audioAscending)
     {
+        // 码率相同时(B站有时给 192K 和 132K 标同样的码率)按标称档位排序，各接口的默认音轨保持一致
         return audioTracks
             .OrderBy(a => encodingPriority.GetValueOrDefault(a.shortCodecs, (byte)100))
             .ThenBy(a => audioAscending ? a.bandwith : -a.bandwith)
+            .ThenBy(a => audioAscending ? StreamPinSelection.AudioNominalRank(a.id) : -StreamPinSelection.AudioNominalRank(a.id))
             .ToList();
+    }
+
+    internal static string DescribeSelectedStreams(Page p, string apiType, Video? video, Audio? audio)
+    {
+        var parts = new List<string> { $"P{p.index}", apiType };
+        if (video != null)
+            parts.Add(string.Join(" ", new[] { video.dfn, video.res, video.codecs }.Where(s => !string.IsNullOrEmpty(s))));
+        if (audio != null)
+            parts.Add(StreamPinSelection.AudioLabel(audio.id) is { } label ? $"{label} {audio.codecs}" : audio.codecs);
+        return string.Join(" · ", parts);
+    }
+
+    /// <summary>
+    /// 下载历史里显示的画质、编码、音质标签，如 ["4K 超清", "HEVC", "192K"]
+    /// </summary>
+    internal static List<string> StreamTags(Video? video, Audio? audio)
+    {
+        var tags = new List<string>();
+        if (!string.IsNullOrWhiteSpace(video?.dfn)) tags.Add(video.dfn);
+        if (!string.IsNullOrWhiteSpace(video?.codecs)) tags.Add(video.codecs);
+        if (audio != null && StreamPinSelection.AudioLabel(audio.id) is { } label) tags.Add(label);
+        return tags;
     }
 
     internal static string FormatSavePath(string savePathFormat, string title, Video? videoTrack, Audio? audioTrack, Page p, int pagesCount, string apiType, long pubTime)

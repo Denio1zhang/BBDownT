@@ -75,15 +75,23 @@ public partial class BBDownTApiServer
         app.MapGet("/ui/status", async () =>
         {
             var ver = Assembly.GetExecutingAssembly().GetName().Version!;
-            var cookieSaved = EnsureWebCookieLoaded();
-            string? userName = null;
+            EnsureWebCookieLoaded();
+            // 与 /parse 使用同一个来源(数据目录里保存的网页登录)，不受正在运行的任务自带的Cookie影响
+            var cookieFile = Path.Combine(Program.APP_DIR, "BBDownT.data");
+            var cookie = File.Exists(cookieFile) ? File.ReadAllText(cookieFile).Trim() : "";
+            var cookieSaved = cookie.Length > 0;
+            var account = WebAccount.Anonymous;
             if (cookieSaved)
             {
-                try { userName = await BBDownTLoginUtil.GetWebLoginUserNameAsync(); }
+                using var _ = Config.UseCredentials(cookie, "");
+                try { account = await WebAccount.FetchAsync(); }
                 catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
             }
             return Results.Json(
-                new UiStatus($"{ver.Major}.{ver.Minor}.{ver.Build}", requireApiToken, cookieSaved, userName),
+                new UiStatus($"{ver.Major}.{ver.Minor}.{ver.Build}", requireApiToken, cookieSaved, account.UserName,
+                    account.IsVip, account.VipLabel,
+                    File.Exists(Path.Combine(Program.APP_DIR, "BBDownTTV.data")),
+                    File.Exists(Path.Combine(Program.APP_DIR, "BBDownTApp.data"))),
                 AppJsonSerializerContext.Default.UiStatus);
         });
 
@@ -132,6 +140,7 @@ public partial class BBDownTApiServer
 
         var filesApi = app.MapGroup("/files");
         filesApi.MapGet("/", () => Results.Json(ListDownloadedFiles(), AppJsonSerializerContext.Default.ListDownloadedFile));
+        MapFileGroupsApi(filesApi);
         filesApi.MapGet("/download", (HttpContext context) =>
         {
             var query = context.Request.Query;
@@ -150,6 +159,8 @@ public partial class BBDownTApiServer
         {
             var fullPath = ResolveDownloadPath(context.Request.Query["path"].ToString());
             if (fullPath is null || !File.Exists(fullPath)) return Results.NotFound();
+            // 正在下载的临时文件夹里的文件(合并好的轨道、单线程下载的 .tmp、封面、字幕)删掉会让混流或任务失败
+            if (IsInActiveDownload(fullPath)) return Results.Text("这个文件所在的下载正在进行，下载结束后才能删除", statusCode: StatusCodes.Status409Conflict);
             File.Delete(fullPath);
             RemoveEmptyParentDirectories(fullPath);
             return Results.Ok();
@@ -197,14 +208,20 @@ public partial class BBDownTApiServer
         var root = DownloadRootFullPath;
         if (!Directory.Exists(root)) return [];
         var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
-        return new DirectoryInfo(root).EnumerateFiles("*", options)
+        var files = new DirectoryInfo(root).EnumerateFiles("*", options)
             .Where(file => !IsProtectedFile(file.FullName))
             .OrderByDescending(file => file.LastWriteTimeUtc)
             .Take(MaxListedFiles)
+            .Select(file => (Info: file, Path: Path.GetRelativePath(root, file.FullName).Replace('\\', '/')))
+            .ToList();
+        // 属于某次下载的文件显示视频标题(来自下载历史，最新的记录优先)
+        var titles = files.Count == 0 ? [] : HistoryTitlesByFile();
+        return files
             .Select(file => new DownloadedFile(
-                Path.GetRelativePath(root, file.FullName).Replace('\\', '/'),
-                file.Length,
-                new DateTimeOffset(file.LastWriteTimeUtc).ToUnixTimeSeconds()))
+                file.Path,
+                file.Info.Length,
+                new DateTimeOffset(file.Info.LastWriteTimeUtc).ToUnixTimeSeconds(),
+                titles.GetValueOrDefault(file.Path)))
             .ToList();
     }
 
@@ -254,10 +271,13 @@ public partial class BBDownTApiServer
     }
 
     /// <summary>
-    /// 下载根目录与程序目录相同时，避免通过文件接口读取或删除登录、配置和归档文件
+    /// 下载根目录与程序目录相同时，避免通过文件接口读取或删除登录、配置和归档文件；
+    /// 另外任何位置的未完成下载说明文件(.bbdownt-task.json)也受保护
     /// </summary>
     internal static bool IsProtectedFile(string fullPath)
     {
+        // 未完成下载的说明文件(在任意子文件夹里)：不列出、不允许单独读取或删除，删除整组时才一并删除
+        if (DownloadWorkFolder.IsMetadataFileName(Path.GetFileName(fullPath))) return true;
         var dir = Path.GetDirectoryName(fullPath);
         var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         if (!string.Equals(dir, Program.APP_DIR, comparison) && !string.Equals(dir, Program.EXE_DIR, comparison))
@@ -267,7 +287,8 @@ public partial class BBDownTApiServer
         return ProtectedFileNameRegex().IsMatch(Path.GetFileName(fullPath));
     }
 
-    [GeneratedRegex(@"^BBDownT?(TV|App)?\.(data|config|archives|web\.json)$", RegexOptions.IgnoreCase)]
+    // 也包括下载历史 history.json 及其临时文件、损坏备份，以及 Mac 客户端用来管理引擎进程的 engine.pid
+    [GeneratedRegex(@"^(BBDownT?(TV|App)?\.(data|config|archives|web\.json)|history\.json(\..*)?|engine\.pid)$", RegexOptions.IgnoreCase)]
     private static partial Regex ProtectedFileNameRegex();
 
     [GeneratedRegex("^[A-Za-z0-9]{1,64}$")]
@@ -276,10 +297,12 @@ public partial class BBDownTApiServer
 
 public sealed record UiSessionRequest(string? Token);
 
-public sealed record UiStatus(string Version, bool AuthRequired, bool BiliCookieSaved, string? BiliUserName);
+public sealed record UiStatus(string Version, bool AuthRequired, bool BiliCookieSaved, string? BiliUserName,
+    bool BiliVip, string? BiliVipLabel, bool TvTokenSaved, bool AppTokenSaved);
 
 public sealed record BiliLoginStart(string Key, string QrCode);
 
 public sealed record BiliLoginPoll(string State, string? UserName);
 
-public sealed record DownloadedFile(string Path, long Size, long ModifiedTime);
+/// <param name="Title">下载历史里记录的视频标题；不属于任何记录时为null</param>
+public sealed record DownloadedFile(string Path, long Size, long ModifiedTime, string? Title = null);

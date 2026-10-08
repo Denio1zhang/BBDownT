@@ -7,17 +7,53 @@ namespace BBDownT.Core.Util;
 
 public static class HTTPUtil
 {
-    public static readonly HttpClient AppHttpClient = new(new HttpClientHandler
+    public static readonly HttpClient AppHttpClient = new(CreateAppHttpHandler())
+    {
+        Timeout = TimeSpan.FromMinutes(2)
+    };
+
+    /// <summary>
+    /// 不使用自动Cookie容器：每个请求只携带 Config.COOKIE 或调用方显式设置的Cookie，
+    /// 响应里的 Set-Cookie(如扫码登录成功时下发的SESSDATA)不会被暗中保存并附加到之后的请求上。
+    /// 扫码登录、Cookie刷新都直接读取响应头里的 Set-Cookie，不受影响。
+    /// </summary>
+    internal static HttpClientHandler CreateAppHttpHandler() => new()
     {
         AllowAutoRedirect = true,
         AutomaticDecompression = DecompressionMethods.All,
         MaxConnectionsPerServer = 2048,
+        UseCookies = false,
         ServerCertificateCustomValidationCallback = (_, _, _, sslPolicyErrors) =>
             Config.ALLOW_INSECURE_TLS || sslPolicyErrors == SslPolicyErrors.None
-    })
-    {
-        Timeout = TimeSpan.FromMinutes(2)
     };
+
+    private static readonly AsyncLocal<CancellationToken> flowCancellation = new();
+
+    /// <summary>
+    /// 当前异步流程的取消令牌：只在 <see cref="UseCancellation"/> 的作用域内(如服务器的解析预览)有值，其他流程为 None。
+    /// 本类发出的请求都会带上它，这样超时或客户端断开后正在进行的请求会立即中止，
+    /// 不必逐层修改解析流程各方法的签名。
+    /// </summary>
+    public static CancellationToken FlowCancellation => flowCancellation.Value;
+
+    /// <summary>
+    /// 在当前异步流程内(包括被等待的子方法)使用指定的取消令牌，Dispose 后恢复原值
+    /// </summary>
+    public static IDisposable UseCancellation(CancellationToken token)
+    {
+        var previous = flowCancellation.Value;
+        flowCancellation.Value = token;
+        return new CancellationScope(() => flowCancellation.Value = previous);
+    }
+
+    private sealed class CancellationScope(Action restore) : IDisposable
+    {
+        private int disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) == 0) restore();
+        }
+    }
 
     private static readonly object UserAgentLock = new();
     private static readonly string[] AndroidDevices =
@@ -145,7 +181,7 @@ public static class HTTPUtil
     public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null)
     {
         using var webResponse = (await SendWebRequestAsync(HttpMethod.Get, url, userAgent, sendCookie: true)).EnsureSuccessStatusCode();
-        string htmlCode = await webResponse.Content.ReadAsStringAsync();
+        string htmlCode = await webResponse.Content.ReadAsStringAsync(FlowCancellation);
         LogDebug("Response: {0}", htmlCode);
         return htmlCode;
     }
@@ -154,7 +190,7 @@ public static class HTTPUtil
     {
         using var webResponse = (await SendWebRequestAsync(
             HttpMethod.Get, url, null, sendCookie: true, forceAuthenticatedProfile: true)).EnsureSuccessStatusCode();
-        string htmlCode = await webResponse.Content.ReadAsStringAsync();
+        string htmlCode = await webResponse.Content.ReadAsStringAsync(FlowCancellation);
         LogDebug("Response: {0}", htmlCode);
         return htmlCode;
     }
@@ -169,7 +205,7 @@ public static class HTTPUtil
         var firstIdentity = ResolveRequestIdentity(url, requestedUserAgent, sendCookie, forceAuthenticatedProfile);
         using var webRequest = CreateWebRequest(method, url, firstIdentity, sendCookie);
         LogDebug("获取网页内容: Url: {0}, Headers: {1}", url, webRequest.Headers);
-        var response = await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead);
+        var response = await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead, FlowCancellation);
         if (response.StatusCode != HttpStatusCode.PreconditionFailed || requestedUserAgent is not null)
         {
             return response;
@@ -184,7 +220,7 @@ public static class HTTPUtil
             : "服务端返回HTTP 412，自动更换完整浏览器请求配置后重试");
         using var retryRequest = CreateWebRequest(method, url, retryIdentity.Value, sendCookie);
         LogDebug("重试获取网页内容: Url: {0}, Headers: {1}", url, retryRequest.Headers);
-        return await AppHttpClient.SendAsync(retryRequest, HttpCompletionOption.ResponseHeadersRead);
+        return await AppHttpClient.SendAsync(retryRequest, HttpCompletionOption.ResponseHeadersRead, FlowCancellation);
     }
 
     internal static void ApplyWebRequestHeaders(
@@ -342,8 +378,8 @@ public static class HTTPUtil
             request.Headers.TryAddWithoutValidation("grpc-encoding", "gzip");
         }
 
-        using HttpResponseMessage response = await AppHttpClient.SendAsync(request);
-        byte[] bytes = await response.Content.ReadAsByteArrayAsync();
+        using HttpResponseMessage response = await AppHttpClient.SendAsync(request, FlowCancellation);
+        byte[] bytes = await response.Content.ReadAsByteArrayAsync(FlowCancellation);
 
         return bytes;
     }

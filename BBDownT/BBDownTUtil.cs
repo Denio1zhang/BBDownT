@@ -98,6 +98,10 @@ static partial class BBDownTUtil
                 string bizId = GetQueryString("business_id", input);
                 avid = $"seriesBizId:{bizId}";
             }
+            else if (FavMediaListRegex().Match(input) is { Success: true } favMatch) // 旧版收藏夹播放列表，如 /medialist/detail/ml123
+            {
+                avid = $"favId:{favMatch.Groups[1].Value}:";
+            }
             else if (input.Contains("/channel/collectiondetail?sid="))
             {
                 string bizId = GetQueryString("sid", input);
@@ -162,6 +166,9 @@ static partial class BBDownTUtil
             }
             else
             {
+                // 兜底：按番剧页面解析。只抓取B站自己的网页，不代为请求其他网址(短链展开后也可能指向站外)
+                if (!Uri.TryCreate(input, UriKind.Absolute, out var pageUri) || !IsBilibiliHost(pageUri.Host, includeShortLink: false))
+                    throw new Exception("输入有误");
                 string web = await GetWebSourceAsync(input);
                 Regex regex = StateRegex();
                 string json = regex.Match(web).Groups[1].Value;
@@ -212,6 +219,16 @@ static partial class BBDownTUtil
             throw new Exception("输入有误");
         }
         return await FixAvidAsync(avid);
+    }
+
+    /// <summary>
+    /// B站的网站域名：bilibili.com、bilibili.tv 及其子域；includeShortLink 时也包括短链域名 b23.tv
+    /// </summary>
+    internal static bool IsBilibiliHost(string host, bool includeShortLink)
+    {
+        var name = host.Trim().TrimEnd('.').ToLowerInvariant();
+        static bool Under(string name, string domain) => name == domain || name.EndsWith("." + domain, StringComparison.Ordinal);
+        return Under(name, "bilibili.com") || Under(name, "bilibili.tv") || (includeShortLink && name == "b23.tv");
     }
 
     public static string FormatFileSize(double fileSize)
@@ -537,7 +554,7 @@ static partial class BBDownTUtil
         return sub[..sub.LastIndexOf('.')];
     }
 
-    private static string GetMixinKey(string orig)
+    internal static string GetMixinKey(string orig)
     {
         byte[] mixinKeyEncTab = 
         [
@@ -593,6 +610,8 @@ static partial class BBDownTUtil
     private static partial Regex StateRegex();
     [GeneratedRegex("md(\\d+)")]
     private static partial Regex MdRegex();
+    [GeneratedRegex(@"/medialist/(?:detail|play)/ml(\d+)")]
+    private static partial Regex FavMediaListRegex();
     [GeneratedRegex("(^|&)?(\\w+)=([^&]+)(&|$)?", RegexOptions.Compiled)]
     private static partial Regex QueryRegex();
     [GeneratedRegex("libavutil\\s+(\\d+)\\. +(\\d+)\\.")]
