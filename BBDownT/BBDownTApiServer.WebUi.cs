@@ -75,7 +75,6 @@ public partial class BBDownTApiServer
         app.MapGet("/ui/status", async () =>
         {
             var ver = Assembly.GetExecutingAssembly().GetName().Version!;
-            EnsureWebCookieLoaded();
             // 与 /parse 使用同一个来源(数据目录里保存的网页登录)，不受正在运行的任务自带的Cookie影响
             var cookieFile = Path.Combine(Program.APP_DIR, "BBDownT.data");
             var cookie = File.Exists(cookieFile) ? File.ReadAllText(cookieFile).Trim() : "";
@@ -83,8 +82,7 @@ public partial class BBDownTApiServer
             var account = WebAccount.Anonymous;
             if (cookieSaved)
             {
-                using var _ = Config.UseCredentials(cookie, "");
-                try { account = await WebAccount.FetchAsync(); }
+                try { account = await FetchWebAccountAsync(cookie); }
                 catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
             }
             return Results.Json(
@@ -99,7 +97,9 @@ public partial class BBDownTApiServer
         {
             try
             {
-                var qrCode = await BBDownTLoginUtil.CreateWebLoginQrCodeAsync();
+                // 国内站登录：不受上一个国际站任务留下的全局 COOKIE_IS_INTL、HOST 等影响
+                WebLoginQrCode qrCode;
+                using (Config.UseCredentials("", "")) qrCode = await BBDownTLoginUtil.CreateWebLoginQrCodeAsync();
                 using var qrCodeData = new QRCodeGenerator().CreateQrCode(qrCode.Url, QRCodeGenerator.ECCLevel.Q);
                 var png = new PngByteQRCode(qrCodeData).GetGraphic(8);
                 return Results.Json(
@@ -116,11 +116,11 @@ public partial class BBDownTApiServer
             if (!QrcodeKeyRegex().IsMatch(key)) return Results.BadRequest("无效的二维码Key");
             try
             {
-                var state = await BBDownTLoginUtil.PollWebLoginAsync(key);
+                var (state, cookie) = await BBDownTLoginUtil.PollWebLoginAsync(key);
                 string? userName = null;
-                if (state == QrLoginStatus.Success)
+                if (cookie is not null)
                 {
-                    try { userName = await BBDownTLoginUtil.GetWebLoginUserNameAsync(); }
+                    try { userName = (await FetchWebAccountAsync(cookie)).UserName; }
                     catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
                 }
                 return Results.Json(
@@ -134,7 +134,7 @@ public partial class BBDownTApiServer
         });
         app.MapDelete("/ui/bili-login", () =>
         {
-            BBDownTLoginUtil.LogoutWEB();
+            File.Delete(Path.Combine(Program.APP_DIR, "BBDownT.data"));
             return Results.Ok();
         });
 
@@ -189,16 +189,13 @@ public partial class BBDownTApiServer
     };
 
     /// <summary>
-    /// 服务器启动后首个任务执行前Cookie尚未加载，这里提前从数据目录读取
+    /// 用保存的网页登录Cookie查询账号(国内站)；只作用于本次请求，不改写正在运行的任务使用的全局Cookie
     /// </summary>
-    private static bool EnsureWebCookieLoaded()
+    private static async Task<WebAccount> FetchWebAccountAsync(string cookie)
     {
-        if (!string.IsNullOrEmpty(Config.COOKIE)) return true;
-        var cookieFile = Path.Combine(Program.APP_DIR, "BBDownT.data");
-        if (!File.Exists(cookieFile)) return false;
-        Config.COOKIE = File.ReadAllText(cookieFile);
+        using var _ = Config.UseCredentials(cookie, "");
         AuthenticatedWebProfileStore.Configure(Program.APP_DIR);
-        return !string.IsNullOrEmpty(Config.COOKIE);
+        return await WebAccount.FetchAsync();
     }
 
     private string DownloadRootFullPath => Path.GetFullPath(serverOptions.DownloadRoot);
