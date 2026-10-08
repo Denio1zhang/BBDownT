@@ -51,8 +51,8 @@ public sealed record DownloadWorkMetadata
 }
 
 /// <summary>
-/// 下载时的临时工作文件夹(工作目录下的 &lt;aid&gt;/)：多线程下载的分片 .vclip/.aclip 及其 .resume 校验器、封面、
-/// 合并好的音视频轨道都放在这里，分P完成后清理。下载开始时在里面写入 <see cref="MetadataFileName"/>，
+/// 下载时的临时工作文件夹(工作目录下的 &lt;DownloadId&gt;/，即 av 号或国际站的 intl_&lt;epid&gt;)：多线程下载的分片 .vclip/.aclip
+/// 及其 .resume 续传状态、封面、合并好的音视频轨道都放在这里，分P完成后清理。下载开始时在里面写入 <see cref="MetadataFileName"/>，
 /// 「已下载文件」据此把中断的下载显示为一个带标题、可继续下载的组；文件夹清理时一并删除。
 /// </summary>
 internal static partial class DownloadWorkFolder
@@ -89,10 +89,14 @@ internal static partial class DownloadWorkFolder
     }
 
     /// <summary>
-    /// 分片或分片的 .resume 校验器
+    /// 未完成的下载留下的文件：分片、单线程下载的 .tmp 临时文件(含校验用的 .verify.tmp)及它们的 .resume 续传状态。
+    /// 合并好的轨道旁的 &lt;轨道&gt;.resume 不算：混流后随轨道一起删除，只下载不混流(SkipMux)时它和轨道就是输出
     /// </summary>
-    internal static bool IsClipFile(string fileName) =>
-        TryParseClip(fileName.EndsWith(".resume", StringComparison.Ordinal) ? fileName[..^".resume".Length] : fileName, out _);
+    internal static bool IsPendingFile(string fileName)
+    {
+        var name = fileName.EndsWith(".resume", StringComparison.Ordinal) ? fileName[..^".resume".Length] : fileName;
+        return TryParseClip(name, out _) || name.EndsWith(".tmp", StringComparison.Ordinal);
+    }
 
     /// <summary>
     /// 从轨道名(&lt;aid&gt;.P1.&lt;cid&gt;)取 av 号
@@ -101,26 +105,34 @@ internal static partial class DownloadWorkFolder
         TrackBaseRegex().Match(trackBase) is { Success: true } match ? match.Groups["aid"].Value : null;
 
     /// <summary>
-    /// 下载流程在临时工作文件夹 &lt;aid&gt;/ 里产生的工作文件(文件名以文件夹名即 av 号开头)：
-    /// 分片 NNNNN_&lt;aid&gt;.P&lt;n&gt;.&lt;cid&gt;.vclip/.aclip，以及 .resume 校验器
-    /// (去掉后缀后是分片、轨道 &lt;aid&gt;.P&lt;n&gt;.&lt;cid&gt;.* 或单线程下载的 &lt;aid&gt;….tmp)。
-    /// 别的下载工具留下的 foo.resume 之类不算，免得把普通文件夹当成未完成的下载整个删掉
+    /// 下载流程在临时工作文件夹 &lt;aid&gt;/ 里留下的未完成的工作文件(<see cref="IsPendingFile"/>，文件名以文件夹名即 av 号开头)：
+    /// 分片 NNNNN_&lt;aid&gt;.P&lt;n&gt;.&lt;cid&gt;.vclip/.aclip、单线程下载的 &lt;aid&gt;….tmp，以及它们的 .resume。
+    /// 别的下载工具留下的 foo.resume、foo.tmp 之类不算，免得把普通文件夹当成未完成的下载整个删掉
     /// </summary>
     internal static bool IsWorkFileOf(string fileName, string folderName)
     {
-        if (!IsAidFolderName(folderName)) return false;
+        if (!IsAidFolderName(folderName) || !IsPendingFile(fileName)) return false;
         var prefix = folderName + ".";
-        var isValidator = fileName.EndsWith(".resume", StringComparison.Ordinal);
-        var name = isValidator ? fileName[..^".resume".Length] : fileName;
-        if (TryParseClip(name, out var clip)) return clip.TrackBase.StartsWith(prefix, StringComparison.Ordinal);
-        return isValidator && name.StartsWith(prefix, StringComparison.Ordinal);
+        var name = fileName.EndsWith(".resume", StringComparison.Ordinal) ? fileName[..^".resume".Length] : fileName;
+        return TryParseClip(name, out var clip) ? clip.TrackBase.StartsWith(prefix, StringComparison.Ordinal)
+            : name.StartsWith(prefix, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// 合并分片中断留下的隐藏暂存文件(见 <see cref="MediaOutput"/>)是否属于工作文件夹 &lt;aid&gt;/ 里的轨道
+    /// <see cref="MediaOutput.Write"/> 合并分片或混流时的隐藏暂存文件 .&lt;名&gt;.&lt;guid&gt;.partial&lt;扩展名&gt;(中断时留下)；是的话给出原来的文件名
+    /// </summary>
+    internal static bool TryParseStagedName(string fileName, out string originalName)
+    {
+        var match = StagedNameRegex().Match(fileName);
+        originalName = match.Success ? match.Groups["stem"].Value + match.Groups["ext"].Value : "";
+        return match.Success;
+    }
+
+    /// <summary>
+    /// 合并分片中断留下的隐藏暂存文件是否属于工作文件夹 &lt;aid&gt;/ 里的轨道
     /// </summary>
     internal static bool IsStagedTrackOf(string fileName, string folderName) =>
-        IsAidFolderName(folderName) && MediaOutput.TryParseStagedName(fileName, out var original)
+        IsAidFolderName(folderName) && TryParseStagedName(fileName, out var original)
         && original.StartsWith(folderName + ".", StringComparison.Ordinal);
 
     /// <summary>
@@ -258,22 +270,14 @@ internal static partial class DownloadWorkFolder
     }
 
     /// <summary>
-    /// 一个分P结束时清理工作文件夹：删除对应文件已不存在的 .resume 校验器；
-    /// 文件夹里不再有未完成的工作(分片、.tmp 临时文件、带校验器等待混流的轨道)时删除说明文件。
+    /// 一个分P结束时：文件夹里不再有未完成的工作(<see cref="HasPendingWork"/>)时删除说明文件。
     /// 文件夹是否删除由调用方在之后判断(为空才删)
     /// </summary>
     internal static void CleanUp(string folder)
     {
         try
         {
-            if (!Directory.Exists(folder)) return;
-            foreach (var sidecar in Directory.EnumerateFiles(folder, "*.resume"))
-            {
-                if (!File.Exists(sidecar[..^".resume".Length])) File.Delete(sidecar);
-            }
-            // 合并分片中断留下的隐藏暂存文件(可能有整条轨道那么大)；正在写入的不会这么久没有变化
-            MediaOutput.DeleteStaleStagedFiles(folder, MediaOutput.StaleStagedAge);
-            if (!HasPendingWork(folder)) File.Delete(MetadataPath(folder));
+            if (Directory.Exists(folder) && !HasPendingWork(folder)) File.Delete(MetadataPath(folder));
         }
         catch (Exception e)
         {
@@ -282,26 +286,11 @@ internal static partial class DownloadWorkFolder
     }
 
     /// <summary>
-    /// 文件夹里是否还有未完成的下载：分片、.tmp 临时文件、.resume 校验器或合并中断留下的暂存文件
+    /// 文件夹里是否还有未完成的下载：分片、.tmp 临时文件及它们的 .resume，或合并中断留下的暂存文件
     /// </summary>
     internal static bool HasPendingWork(string folder) =>
         Directory.EnumerateFiles(folder).Select(Path.GetFileName).Any(name => name is not null
-            && (IsClipFile(name) || name.EndsWith(".resume", StringComparison.Ordinal) || name.EndsWith(".tmp", StringComparison.Ordinal)
-                || MediaOutput.TryParseStagedName(name, out _))
-            && !IsMetadataFileName(name));
-
-    /// <summary>
-    /// 只下载不混流(SkipMux)时轨道本身就是输出：删除它们旁边的续传校验器后照常清理
-    /// </summary>
-    internal static void FinishTracks(string folder, params string[] tracks)
-    {
-        foreach (var track in tracks.Where(track => !string.IsNullOrEmpty(track)))
-        {
-            try { File.Delete(track + ".resume"); }
-            catch (Exception e) { Logger.LogDebug("删除续传校验器失败: {0}", e.Message); }
-        }
-        CleanUp(folder);
-    }
+            && (IsPendingFile(name) || TryParseStagedName(name, out _)) && !IsMetadataFileName(name));
 
     [GeneratedRegex(@"^(?<index>\d{5})_(?<base>.+)\.(?<kind>vclip|aclip)$")]
     private static partial Regex ClipRegex();
@@ -311,6 +300,9 @@ internal static partial class DownloadWorkFolder
 
     [GeneratedRegex(@"^\.bbdownt-task\.json(\..*)?$", RegexOptions.IgnoreCase)]
     private static partial Regex MetadataNameRegex();
+
+    [GeneratedRegex(@"^\.(?<stem>.+)\.[0-9a-f]{32}\.partial(?<ext>\.[^.]*)?$")]
+    private static partial Regex StagedNameRegex();
 }
 
 /// <param name="Index">分片序号</param>

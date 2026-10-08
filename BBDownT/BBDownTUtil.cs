@@ -46,18 +46,26 @@ static partial class BBDownTUtil
             && candidate.CompareTo(current) > 0;
     }
 
-    public static async Task<string> GetAvIdAsync(string input)
+    public static Task<string> GetAvIdAsync(string input)
+        => GetAvIdAsync(input, GetWebLocationAsync);
+
+    internal static async Task<string> GetAvIdAsync(string input, Func<string, Task<string>> fetchLocation)
     {
+        if (IntlBangumiUrl.TryParse(input, out var internationalId)) return internationalId;
         var avid = input;
-        if (input.StartsWith("http"))
+        if (input.StartsWith("http", StringComparison.OrdinalIgnoreCase))
         {
-            if (input.Contains("b23.tv"))
+            if (IsShortLinkUri(input))
             {
-                string tmp = await GetWebLocationAsync(input);
+                string tmp = await fetchLocation(input);
                 if (tmp == input) throw new Exception("无限重定向");
                 input = tmp;
             }
-            if (input.Contains("video/av"))
+            if (IntlBangumiUrl.TryParse(input, out internationalId))
+            {
+                avid = internationalId;
+            }
+            else if (input.Contains("video/av"))
             {
                 avid = AvRegex().Match(input).Groups[1].Value;
             }
@@ -153,11 +161,6 @@ static partial class BBDownTUtil
                 string epId = GetQueryString("ep_id", input);
                 avid = $"ep:{epId}";
             }
-            else if (GlobalEpRegex().Match(input).Success)
-            {
-                string epId = GlobalEpRegex().Match(input).Groups[1].Value;
-                avid = $"ep:{epId}";
-            }
             else if (BangumiMdRegex().Match(input).Success)
             {
                 string mdId = BangumiMdRegex().Match(input).Groups[1].Value;
@@ -167,7 +170,7 @@ static partial class BBDownTUtil
             else
             {
                 // 兜底：按番剧页面解析。只抓取B站自己的网页，不代为请求其他网址(短链展开后也可能指向站外)
-                if (!Uri.TryCreate(input, UriKind.Absolute, out var pageUri) || !IsBilibiliHost(pageUri.Host, includeShortLink: false))
+                if (!Uri.TryCreate(input, UriKind.Absolute, out var pageUri) || !IsBilibiliHost(pageUri.Host))
                     throw new Exception("输入有误");
                 string web = await GetWebSourceAsync(input);
                 Regex regex = StateRegex();
@@ -218,18 +221,24 @@ static partial class BBDownTUtil
         {
             throw new Exception("输入有误");
         }
-        return await FixAvidAsync(avid);
+        return await FixAvidAsync(avid, fetchLocation);
     }
 
     /// <summary>
-    /// B站的网站域名：bilibili.com、bilibili.tv 及其子域；includeShortLink 时也包括短链域名 b23.tv
+    /// B站的网站域名：bilibili.com、bilibili.tv 及其子域(短链域名见 <see cref="IsShortLinkUri"/>)
     /// </summary>
-    internal static bool IsBilibiliHost(string host, bool includeShortLink)
+    internal static bool IsBilibiliHost(string host)
     {
         var name = host.Trim().TrimEnd('.').ToLowerInvariant();
         static bool Under(string name, string domain) => name == domain || name.EndsWith("." + domain, StringComparison.Ordinal);
-        return Under(name, "bilibili.com") || Under(name, "bilibili.tv") || (includeShortLink && name == "b23.tv");
+        return Under(name, "bilibili.com") || Under(name, "bilibili.tv");
     }
+
+    internal static bool IsShortLinkUri(string input)
+        => Uri.TryCreate(input, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            && uri.UserInfo.Length == 0
+            && uri.Host.ToLowerInvariant() is "b23.tv" or "www.b23.tv" or "bili.im" or "www.bili.im";
 
     public static string FormatFileSize(double fileSize)
     {
@@ -263,12 +272,12 @@ static partial class BBDownTUtil
     /// </summary>
     /// <param name="avid"></param>
     /// <returns></returns>
-    private static async Task<string> FixAvidAsync(string avid)
+    private static async Task<string> FixAvidAsync(string avid, Func<string, Task<string>> fetchLocation)
     {
         if (!avid.All(char.IsDigit))
             return avid;
         string api = $"https://www.bilibili.com/video/av{avid}/";
-        string location = await GetWebLocationAsync(api);
+        string location = await fetchLocation(api);
         return location.Contains("/ep") ? $"ep:{EpRegex().Match(location).Groups[1].Value}" : avid;
     }
 
@@ -511,18 +520,30 @@ static partial class BBDownTUtil
     public static string GetFFmpegMetaString(List<ViewPoint> points)
     {
         StringBuilder sb = new();
-        sb.AppendLine(";FFMETADATA");
+        sb.AppendLine(";FFMETADATA1");
         foreach (var p in points)
         {
             var time = 1000; //固定 1000
             sb.AppendLine("[CHAPTER]");
             sb.AppendLine($"TIMEBASE=1/{time}");
-            sb.AppendLine($"START={p.start * time}");
-            sb.AppendLine($"END={p.end * time}");
-            sb.AppendLine($"title={p.title}");
+            sb.AppendLine($"START={(long)p.start * time}");
+            sb.AppendLine($"END={(long)p.end * time}");
+            sb.AppendLine($"title={EscapeFFmpegMetadata(p.title)}");
             sb.AppendLine();
         }
         return sb.ToString();
+    }
+
+    private static string EscapeFFmpegMetadata(string? value)
+    {
+        var escaped = new StringBuilder();
+        foreach (var character in (value ?? "").Replace("\r\n", "\n").Replace('\r', '\n'))
+        {
+            if (character is '=' or ';' or '#' or '\\' or '\n')
+                escaped.Append('\\');
+            escaped.Append(character);
+        }
+        return escaped.ToString();
     }
 
     /// <summary>
@@ -602,8 +623,6 @@ static partial class BBDownTUtil
     private static partial Regex SsRegex();
     [GeneratedRegex(@"space\.bilibili\.com/(\d+)")]
     private static partial Regex UidRegex();
-    [GeneratedRegex(@"\.bilibili\.tv\/\w+\/play\/\d+\/(\d+)")]
-    private static partial Regex GlobalEpRegex();
     [GeneratedRegex("bangumi/media/(md\\d+)")]
     private static partial Regex BangumiMdRegex();
     [GeneratedRegex(@"window.__INITIAL_STATE__=([\s\S].*?);\(function\(\)")]

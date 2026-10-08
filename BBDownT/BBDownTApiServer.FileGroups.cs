@@ -23,7 +23,7 @@ namespace BBDownT;
 public partial class BBDownTApiServer
 {
     /// <summary>
-    /// 分组时最多统计的文件数(最新的优先)；一个4K视频的分片和校验器就有一两百个，比 /files 的上限大
+    /// 分组时最多统计的文件数(最新的优先)；一个4K视频的分片和续传状态就有一两百个，比 /files 的上限大
     /// </summary>
     internal const int MaxGroupedFiles = 20000;
 
@@ -177,7 +177,7 @@ public partial class BBDownTApiServer
         }
         var running = taskStore.GetRunningSnapshot();
         var groups = DownloadFileGroups.Build(files, historyEntries, metadata,
-            relative => DownloadResumeValidator.Load(Path.Combine(root, relative)),
+            relative => ReadResumeState(Path.Combine(root, relative)),
             (dir, aid, _) => IsWorkFolderActive(Path.Combine(root, dir), aid, running),
             titleFor ?? (aid => (Titles.TryGet(aid), Titles.IsPending(aid))),
             hiddenFiles: hidden);
@@ -219,7 +219,24 @@ public partial class BBDownTApiServer
     /// 下载流程产生的隐藏文件：未完成下载的说明文件(及其写入时的临时文件)、合并分片或混流的暂存文件
     /// </summary>
     private static bool IsEngineHiddenFile(string name) =>
-        DownloadWorkFolder.IsMetadataFileName(name) || MediaOutput.TryParseStagedName(name, out _);
+        DownloadWorkFolder.IsMetadataFileName(name) || DownloadWorkFolder.TryParseStagedName(name, out _);
+
+    /// <summary>
+    /// 分片的续传状态(下载流程写入的 JSON)；读不出或不是有效状态时为null
+    /// </summary>
+    private static DownloadResumeState? ReadResumeState(string path)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+            return file.Exists && file.Length <= 64 * 1024 ? DownloadResumeState.Parse(File.ReadAllText(path)) : null;
+        }
+        catch (Exception e)
+        {
+            Logger.LogDebug("读取续传状态失败: {0}", e.Message);
+            return null;
+        }
+    }
 
     /// <summary>
     /// 数据目录(登录信息、配置、下载历史)或程序目录在下载根目录之内时，其中的文件不分组、不删除

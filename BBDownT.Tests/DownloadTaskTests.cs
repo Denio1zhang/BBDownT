@@ -36,34 +36,6 @@ public class DownloadTaskTests
     }
 
     [Fact]
-    public void ProgressBar_CountsBytesDownloadedWithinTheLastSecondWhenDisposed()
-    {
-        // 小文件常常在第一次测速(1秒)之前就下载完了，以前这部分字节不计入任务的已下载量
-        var task = new DownloadTask("1", "BV1xx", 1);
-        using (var progress = new ProgressBar(task))
-        {
-            progress.Report(0.5, 900_000);
-            progress.Report(1, 2_000_000);
-        }
-
-        Assert.Equal(2_000_000, task.CreateSnapshot().TotalDownloadedBytes);
-    }
-
-    [Fact]
-    public void ProgressBar_KeepsTheLargestCumulativeCountWhenClipThreadsReportOutOfOrder()
-    {
-        // 多线程下载：一个线程较早算出的较小合计可能在另一个线程的完整合计之后才写入
-        var task = new DownloadTask("1", "BV1xx", 1);
-        using (var progress = new ProgressBar(task))
-        {
-            progress.Report(1, 1_722_240);
-            progress.Report(0.95, 1_649_313);
-        }
-
-        Assert.Equal(1_722_240, task.CreateSnapshot().TotalDownloadedBytes);
-    }
-
-    [Fact]
     public void AddSavePath_RecordsAbsolutePathsResolvedAgainstTheTaskWorkingDirectory()
     {
         var task = new DownloadTask("1", "BV1xx", 1);

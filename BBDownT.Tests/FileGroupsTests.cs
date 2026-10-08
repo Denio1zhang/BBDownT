@@ -5,10 +5,17 @@ namespace BBDownT.Tests;
 /// </summary>
 public class FileGroupsTests
 {
-    private const int Clip = BBDownTDownloadUtil.DefaultClipSize;
+    private const int Clip = 20 * 1024 * 1024;
     private static readonly Dictionary<string, DownloadWorkMetadata> NoMetadata = new();
 
     private static ListedFile F(string path, long size = 10, long time = 1000) => new(path, size, time);
+
+    /// <summary>
+    /// 下载流程写入分片 .resume 的续传状态：这一段 [from, from+length) 已下载 local 字节
+    /// </summary>
+    private static DownloadResumeState State(long length, long local, long from = 0) =>
+        new("track", "source", from, from + length - 1, from + length, local == length, local, new string('0', 64),
+            new DownloadResumeValidator("\"v\"", null));
 
     private static DownloadHistoryEntry Entry(string title, string bvid, long finishedAt, params string[] files) =>
         DownloadHistoryStoreTests.Entry(title, "UP", bvid, finishedAt, files) with { Pic = "https://i0.hdslb.com/bfs/archive/" + bvid + ".jpg" };
@@ -132,12 +139,12 @@ public class FileGroupsTests
         {
             ["115050127886063"] = new() { Title = "4K 城市夜景", Owner = "UP", Pic = "https://i0.hdslb.com/x.jpg", Aid = "115050127886063", Bvid = "BV1t1YxzWEkz", Page = 1, Request = request }
         };
-        // 视频轨道总长 2*Clip+1000(第3段完整)，音频总长 8000(第1段只下载了一半)
-        DownloadResumeValidator? Validator(string path) => path.Contains(".vclip")
-            ? new("\"v\"", null, 2L * Clip + 1000)
-            : new("\"a\"", null, 8000);
+        // 视频的3段都已下载完整，音频第1段(8000字节)只下载了一半
+        DownloadResumeState? StateOf(string path) => path.Contains(".vclip")
+            ? State(files.Single(file => file.Path + ".resume" == path).Size, files.Single(file => file.Path + ".resume" == path).Size)
+            : State(8000, 4000);
 
-        var groups = DownloadFileGroups.Build(files, [], metadata, Validator);
+        var groups = DownloadFileGroups.Build(files, [], metadata, StateOf);
 
         var work = Single(groups, "w:115050127886063");
         Assert.Equal(FileGroupStatus.Incomplete, work.Status);
@@ -152,7 +159,7 @@ public class FileGroupsTests
         Assert.Equal(["115050127886063/115050127886063.jpg"], work.Files.Select(f => f.Path));
         Assert.Equal(4, work.ClipCount);
         Assert.Equal(3, work.CompleteClipCount);
-        // 删除整组时删除的全部文件：4个分片、4个校验器和封面
+        // 删除整组时删除的全部文件：4个分片、4个续传状态和封面
         Assert.Equal(9, work.FileCount);
         Assert.Equal(2L * Clip + 1000 + 4000 + 5000 + 4 * 83, work.TotalBytes);
         Assert.Equal(1950, work.ModifiedTime);
@@ -160,7 +167,7 @@ public class FileGroupsTests
         Assert.Equal([("video", 0, true), ("video", 1, true), ("video", 2, true), ("audio", 0, false)],
             work.Clips.Select(c => (c.Track, c.Index, c.Complete)));
         Assert.All(work.Clips, c => Assert.Equal(1, c.Page));
-        // 删除整组时连同校验器一起删除
+        // 删除整组时连同续传状态一起删除
         Assert.Equal(9, work.MemberPaths.Count);
         Assert.Single(groups, g => g.Id == "s:done");
     }
@@ -182,8 +189,8 @@ public class FileGroupsTests
         Assert.Null(pending.Request);
         Assert.Equal("BV1t1YxzWEkz", pending.Bvid);
         Assert.Equal("https://www.bilibili.com/video/BV1t1YxzWEkz/", pending.Url);
-        // 旧版本：标准大小的分片算完整；有校验器、不足标准大小的是下载到一半的
-        Assert.Equal([true, false], pending.Clips.Select(c => c.Complete));
+        // 没有续传状态可读(旧版本或别的工具)：无法确认分片完整
+        Assert.Equal([false, false], pending.Clips.Select(c => c.Complete));
 
         var failed = Assert.Single(DownloadFileGroups.Build(files, [], NoMetadata, titleFor: _ => (null, false)));
         Assert.Equal("未完成的下载（av115050127886063）", failed.Title);
@@ -212,7 +219,7 @@ public class FileGroupsTests
         Assert.Equal("123", group.Aid);
         Assert.Equal("未完成的下载（av123）", group.Title);
         Assert.Equal(2, group.Clips[0].Page);
-        // 只有一段、整条轨道都没有校验器：无法确认是否下载完整，按未完成显示
+        // 没有续传状态：无法确认是否下载完整，按未完成显示
         Assert.False(group.Clips[0].Complete);
     }
 
@@ -222,6 +229,8 @@ public class FileGroupsTests
     [InlineData("123", "foo.resume")]
     [InlineData("123", "456.P1.7.mp4.resume")]
     [InlineData("123", "00000_456.P1.7.vclip")]
+    // 合并好的轨道旁的续传状态：只下载不混流时它和轨道就是输出
+    [InlineData("123", "123.P1.456.mp4.resume")]
     public void ForeignResumeOrClipFiles_DoNotMakeAFolderAnIncompleteDownload(string folder, string name)
     {
         var files = new[] { F($"{folder}/{name}"), F($"{folder}/视频.mp4", 500) };
@@ -233,7 +242,8 @@ public class FileGroupsTests
     }
 
     [Theory]
-    [InlineData("123.P1.456.mp4.resume")]
+    [InlineData("123.P1.456.mp4.tmp")]
+    [InlineData("123.P1.456.mp4.verify.tmp.resume")]
     [InlineData("123.P1.456.tmp.resume")]
     [InlineData("123.tmp.resume")]
     [InlineData("00000_123.P1.456.vclip.resume")]
@@ -314,24 +324,67 @@ public class FileGroupsTests
     }
 
     [Fact]
-    public void ClipCompleteness_UsesTheTrackTotalOrTheLegacyValidatorConvention()
+    public void ClipCompleteness_ComesFromTheResumeStateWrittenByTheDownload()
     {
         var files = new[]
         {
-            // 轨道 1：第2段的校验器记下了总长度 → 第3段按应有长度判断(即使它自己没有校验器)
-            F("10/00000_10.P1.1.vclip", Clip), F("10/00001_10.P1.1.vclip", 500), F("10/00001_10.P1.1.vclip.resume", 83),
-            F("10/00002_10.P1.1.vclip", 900),
-            // 轨道 2：旧版本(有校验器的是下载到一半的)：没有校验器、不足标准大小的最后一段是完整的
-            F("10/00000_10.P2.2.vclip", Clip), F("10/00001_10.P2.2.vclip", 400), F("10/00001_10.P2.2.vclip.resume", 83),
-            F("10/00002_10.P2.2.vclip", 300),
-            // 轨道 3：整条轨道都没有校验器 → 最后一段无法确认
-            F("10/00000_10.P3.3.vclip", Clip), F("10/00001_10.P3.3.vclip", 300),
+            F("10/00000_10.P1.1.vclip", Clip), F("10/00000_10.P1.1.vclip.resume", 300),
+            F("10/00001_10.P1.1.vclip", 500), F("10/00001_10.P1.1.vclip.resume", 300),
+            F("10/00002_10.P1.1.vclip", 900), F("10/00002_10.P1.1.vclip.resume", 300),
+            F("10/00003_10.P1.1.vclip", 700), F("10/00003_10.P1.1.vclip.resume", 300),
+            // 没有续传状态
+            F("10/00004_10.P1.1.vclip", 300),
         };
-        DownloadResumeValidator? Validator(string path) => path.Contains(".P1.") ? new("\"v\"", null, 2L * Clip + 1000) : new("\"v\"", null);
+        var states = new Dictionary<string, DownloadResumeState?>
+        {
+            ["10/00000_10.P1.1.vclip.resume"] = State(Clip, Clip),
+            // 只下载了一部分
+            ["10/00001_10.P1.1.vclip.resume"] = State(Clip, 500, Clip),
+            // 记下已完整，但本地文件长度不符(被改动过)
+            ["10/00002_10.P1.1.vclip.resume"] = State(1000, 1000, 2L * Clip),
+            // 读不出有效的状态(旧格式或损坏)
+            ["10/00003_10.P1.1.vclip.resume"] = null,
+        };
 
-        var work = Assert.Single(DownloadFileGroups.Build(files, [], NoMetadata, Validator));
+        var work = Assert.Single(DownloadFileGroups.Build(files, [], NoMetadata, path => states.GetValueOrDefault(path)));
 
-        Assert.Equal([true, false, false, true, false, true, true, false], work.Clips.Select(c => c.Complete));
+        Assert.Equal([true, false, false, false, false], work.Clips.Select(c => c.Complete));
+    }
+
+    [Fact]
+    public void FinishedSkipMuxTracksAndTheirResumeState_AreNotAnIncompleteDownload()
+    {
+        // 只下载不混流：轨道和它们旁边的续传状态(供重新下载时直接沿用)留在工作文件夹里，说明文件已删除
+        var files = new[]
+        {
+            F("10/10.P1.20.mp4", 100), F("10/10.P1.20.mp4.resume", 300), F("10/10.P1.20.m4a", 50), F("10/10.P1.20.m4a.resume", 300),
+        };
+
+        var group = Assert.Single(DownloadFileGroups.Build(files, [], NoMetadata));
+
+        Assert.Equal(FileGroupStatus.Complete, group.Status);
+        Assert.Equal("s:10/10.P1.20", group.Id);
+        Assert.Equal(4, group.FileCount);
+        Assert.Equal("10/10.P1.20.mp4", group.MainFile);
+    }
+
+    [Fact]
+    public void InternationalWorkFolder_IsRecognizedByItsMetadata()
+    {
+        // 国际站没有 av 号：工作文件夹是 intl_<epid>，靠说明文件识别
+        var files = new[] { F("intl_123/00000_intl_123.P1.456.vclip", 70), F("intl_123/00000_intl_123.P1.456.vclip.resume", 300) };
+        var metadata = new Dictionary<string, DownloadWorkMetadata>
+        {
+            ["intl_123"] = new() { Title = "国际站番剧", Request = new() { Url = "https://www.bilibili.tv/en/play/1/123", UseIntlApi = true } }
+        };
+
+        var group = Assert.Single(DownloadFileGroups.Build(files, [], metadata));
+
+        Assert.Equal("w:intl_123", group.Id);
+        Assert.Equal("国际站番剧", group.Title);
+        Assert.Null(group.Aid);
+        Assert.Equal("https://www.bilibili.tv/en/play/1/123", group.Url);
+        Assert.Equal(1, group.ClipCount);
     }
 
     [Fact]
@@ -375,21 +428,6 @@ public class FileGroupsTests
             isActive: (folder, aid, modified) => folder == "10" && aid == "10" && modified == 5000));
 
         Assert.True(group.Active);
-    }
-
-    [Theory]
-    [InlineData(Clip, 0, null, false, false, 0, true)]
-    [InlineData(1000L, 0, null, true, true, 0, false)]
-    [InlineData(1000L, 3, null, false, true, 3, true)]
-    [InlineData(1000L, 3, null, false, false, 3, false)]
-    [InlineData(1000L, 2, null, false, true, 3, false)]
-    [InlineData(1000L, 2, 2L * Clip + 1000, true, true, 2, true)]
-    [InlineData(1000L, 2, 2L * Clip + 1000, false, true, 5, true)]
-    [InlineData(999L, 2, 2L * Clip + 1000, true, true, 2, false)]
-    [InlineData(0L, 0, null, false, true, 0, false)]
-    public void IsCompleteClip(long size, int index, long? total, bool hasValidatorFile, bool trackHasValidators, int lastIndex, bool expected)
-    {
-        Assert.Equal(expected, DownloadFileGroups.IsCompleteClip(size, index, total, hasValidatorFile, trackHasValidators, lastIndex, Clip));
     }
 
     [Theory]

@@ -118,7 +118,7 @@ public partial class BBDownTApiServer
             {
                 var state = await BBDownTLoginUtil.PollWebLoginAsync(key);
                 string? userName = null;
-                if (state == WebLoginState.Success)
+                if (state == QrLoginStatus.Success)
                 {
                     try { userName = await BBDownTLoginUtil.GetWebLoginUserNameAsync(); }
                     catch (Exception e) { LogDebug("获取登录状态失败: {0}", e.Message); }
@@ -288,7 +288,8 @@ public partial class BBDownTApiServer
     }
 
     // 也包括下载历史 history.json 及其临时文件、损坏备份，以及 Mac 客户端用来管理引擎进程的 engine.pid
-    [GeneratedRegex(@"^(BBDownT?(TV|App)?\.(data|config|archives|web\.json)|history\.json(\..*)?|engine\.pid)$", RegexOptions.IgnoreCase)]
+    // 登录文件含国际站 BBDownTIntl.data，以及保存登录时写到一半的临时文件 *.data.writing-<guid>
+    [GeneratedRegex(@"^(BBDownT?(TV|App|Intl)?\.(data(\.writing-[0-9a-f]{32})?|config|archives|web\.json)|history\.json(\..*)?|engine\.pid)$", RegexOptions.IgnoreCase)]
     private static partial Regex ProtectedFileNameRegex();
 
     [GeneratedRegex("^[A-Za-z0-9]{1,64}$")]

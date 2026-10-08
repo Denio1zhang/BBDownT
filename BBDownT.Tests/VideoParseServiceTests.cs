@@ -67,6 +67,25 @@ public class VideoParseServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task IntlParse_UsesTheSavedInternationalCookieWithoutTokensOrTheDomesticAccount()
+    {
+        var fake = new FakeBili();
+        fake.Files["BBDownTIntl.data"] = "Cookie: SESSDATA=intl;bstar-web-lang=en";
+        fake.Files["BBDownTApp.data"] = "access_token=app";
+
+        // 与下载任务相同：国际站优先于 APP 接口
+        var result = await fake.Service().ParseAsync(new ParseRequest { Url = "BV1xx", UseIntlApi = true, UseAppApi = true });
+
+        Assert.Equal("INTL", result.RequestedApi);
+        Assert.Equal("SESSDATA=intl; bstar-web-lang=en", fake.CookieSeenByFetch);
+        Assert.Equal("", fake.TokenSeenByFetch);
+        Assert.True(fake.IntlSeenByFetch);
+        Assert.False(fake.AccountFetched);
+        Assert.True(result.Account.ApiAuthenticated);
+        Assert.False(Config.COOKIE_IS_INTL);
+    }
+
+    [Fact]
     public async Task Parse_UsesExplicitRequestCookieInsteadOfSavedLogin()
     {
         var fake = new FakeBili();
@@ -287,6 +306,8 @@ public class VideoParseServiceTests : IDisposable
     [InlineData("https://www.bilibili.com/video/BV1xx411c7mD", true)]
     [InlineData("https://m.bilibili.com/video/BV1xx411c7mD", true)]
     [InlineData("https://b23.tv/abc", true)]
+    [InlineData("https://bili.im/abc", true)]
+    [InlineData("https://user@b23.tv/abc", false)]
     [InlineData("https://www.bilibili.tv/en/play/1/2", true)]
     [InlineData("BV1xx411c7mD", true)]
     [InlineData("cheese/ep123", true)]
@@ -453,6 +474,7 @@ public class VideoParseServiceTests : IDisposable
         public string? CookieSeenByFetch { get; private set; }
         public string? CookieSeenByAccount { get; private set; }
         public string? TokenSeenByFetch { get; private set; }
+        public bool IntlSeenByFetch { get; private set; }
         public Page? PageSeenByFetch { get; private set; }
         public bool InfoFetched => InfoFetchCount > 0;
         public int InfoFetchCount { get; private set; }
@@ -484,7 +506,7 @@ public class VideoParseServiceTests : IDisposable
             (option, _) =>
             {
                 InfoFetchCount++;
-                var api = VideoParseService.ApiName(option);
+                var api = Program.GetApiType(option);
                 if (FlipTvToWeb && option.UseTvApi)
                 {
                     option.UseTvApi = false;
@@ -499,6 +521,7 @@ public class VideoParseServiceTests : IDisposable
                 CancellationSeenByFetch = BBDownT.Core.Util.HTTPUtil.FlowCancellation;
                 CookieSeenByFetch = Config.COOKIE;
                 TokenSeenByFetch = Config.TOKEN;
+                IntlSeenByFetch = Config.COOKIE_IS_INTL;
                 PageSeenByFetch = page;
                 return Task.FromResult(new ParsedResult
                 {

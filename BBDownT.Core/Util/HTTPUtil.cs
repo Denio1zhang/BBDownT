@@ -1,37 +1,44 @@
 ﻿using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Security;
+using System.Security.Authentication;
 using static BBDownT.Core.Logger;
 
 namespace BBDownT.Core.Util;
 
 public static class HTTPUtil
 {
-    public static readonly HttpClient AppHttpClient = new(CreateAppHttpHandler())
-    {
-        Timeout = TimeSpan.FromMinutes(2)
-    };
-
     /// <summary>
     /// 不使用自动Cookie容器：每个请求只携带 Config.COOKIE 或调用方显式设置的Cookie，
-    /// 响应里的 Set-Cookie(如扫码登录成功时下发的SESSDATA)不会被暗中保存并附加到之后的请求上。
+    /// 响应里的 Set-Cookie(如扫码登录成功时下发的SESSDATA)不会被暗中保存并附加到之后的请求上
+    /// (服务器的游客解析、使用其他账号的任务、退出登录后的请求)。
     /// 扫码登录、Cookie刷新都直接读取响应头里的 Set-Cookie，不受影响。
     /// </summary>
-    internal static HttpClientHandler CreateAppHttpHandler() => new()
+    public static readonly HttpClient AppHttpClient = CreateClient(useCookies: false, allowRedirects: true);
+    internal static readonly HttpClient IntlApiHttpClient = CreateClient(useCookies: false, allowRedirects: false);
+    internal static readonly HttpClient IntlMediaHttpClient = CreateClient(useCookies: false, allowRedirects: true);
+
+    private static HttpClient CreateClient(bool useCookies, bool allowRedirects)
+        => new(CreateWebHandler(useCookies, allowRedirects)) { Timeout = TimeSpan.FromMinutes(2) };
+
+    internal static HttpClientHandler CreateWebHandler(bool useCookies, bool allowRedirects) => new()
     {
-        AllowAutoRedirect = true,
+        AllowAutoRedirect = allowRedirects,
+        UseCookies = useCookies,
         AutomaticDecompression = DecompressionMethods.All,
         MaxConnectionsPerServer = 2048,
-        UseCookies = false,
         ServerCertificateCustomValidationCallback = (_, _, _, sslPolicyErrors) =>
             Config.ALLOW_INSECURE_TLS || sslPolicyErrors == SslPolicyErrors.None
     };
+
+    internal static HttpClient GetWebHttpClient(bool international) => international ? IntlApiHttpClient : AppHttpClient;
+    internal static HttpClient GetMediaHttpClient(bool international) => international ? IntlMediaHttpClient : AppHttpClient;
 
     private static readonly AsyncLocal<CancellationToken> flowCancellation = new();
 
     /// <summary>
     /// 当前异步流程的取消令牌：只在 <see cref="UseCancellation"/> 的作用域内(如服务器的解析预览)有值，其他流程为 None。
-    /// 本类发出的请求都会带上它，这样超时或客户端断开后正在进行的请求会立即中止，
+    /// 没有显式传入令牌的请求都会带上它，这样超时或客户端断开后正在进行的请求(包括重试前的等待)会立即中止，
     /// 不必逐层修改解析流程各方法的签名。
     /// </summary>
     public static CancellationToken FlowCancellation => flowCancellation.Value;
@@ -160,14 +167,39 @@ public static class HTTPUtil
         }
 
         var host = uri.Host;
+        if (Config.COOKIE_IS_INTL && !IsIntlCookieDestination(uri))
+            return false;
         return Config.COOKIE_ALLOWED_DOMAINS.Any(domain =>
             string.Equals(host, domain, StringComparison.OrdinalIgnoreCase)
             || host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase));
     }
 
+    private static bool IsIntlCookieDestination(Uri uri)
+    {
+        if (uri.Scheme != Uri.UriSchemeHttps || uri.UserInfo.Length != 0) return false;
+        if (IsDomain(uri.Host, "bilibili.tv") || IsDomain(uri.Host, "biliintl.com")) return true;
+        // A custom parsing host is an explicit credential-forwarding choice;
+        // an allowed media/CDN host alone is not such authorization.
+        return uri.AbsolutePath.StartsWith("/intl/gateway/", StringComparison.Ordinal)
+            && (MatchesIntlProxy(uri, Config.HOST) || MatchesIntlProxy(uri, Config.EPHOST));
+    }
+
+    private static bool IsDomain(string host, string domain)
+        => host.Equals(domain, StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase);
+
+    private static bool MatchesIntlProxy(Uri target, string configuredHost)
+    {
+        if (!Uri.TryCreate(configuredHost.Contains("://", StringComparison.Ordinal) ? configuredHost : "https://" + configuredHost,
+            UriKind.Absolute, out var configured) || configured.Scheme != Uri.UriSchemeHttps
+            || IsDomain(configured.Host, "bilibili.com") || configured.UserInfo.Length != 0)
+            return false;
+        return target.Host.Equals(configured.Host, StringComparison.OrdinalIgnoreCase) && target.Port == configured.Port;
+    }
+
     public static string GetCookieHeaderValue(string url)
     {
-        return (url.Contains("/ep") || url.Contains("/ss")) ? Config.COOKIE + ";CURRENT_FNVAL=4048;" : Config.COOKIE;
+        return !Config.COOKIE_IS_INTL && (url.Contains("/ep") || url.Contains("/ss")) ? Config.COOKIE + ";CURRENT_FNVAL=4048;" : Config.COOKIE;
     }
 
     public static void TryAddCookieHeader(HttpRequestMessage request, string url)
@@ -180,47 +212,135 @@ public static class HTTPUtil
 
     public static async Task<string> GetWebSourceAsync(string url, string? userAgent = null)
     {
-        using var webResponse = (await SendWebRequestAsync(HttpMethod.Get, url, userAgent, sendCookie: true)).EnsureSuccessStatusCode();
-        string htmlCode = await webResponse.Content.ReadAsStringAsync(FlowCancellation);
+        string htmlCode = await GetWebSourceAsync(GetWebHttpClient(Config.COOKIE_IS_INTL), url, userAgent,
+            cancellationToken: FlowCancellation);
         LogDebug("Response: {0}", htmlCode);
         return htmlCode;
     }
 
     internal static async Task<string> GetAuthenticatedWebSourceAsync(string url)
     {
-        using var webResponse = (await SendWebRequestAsync(
-            HttpMethod.Get, url, null, sendCookie: true, forceAuthenticatedProfile: true)).EnsureSuccessStatusCode();
-        string htmlCode = await webResponse.Content.ReadAsStringAsync(FlowCancellation);
+        string htmlCode = await GetWebSourceAsync(GetWebHttpClient(Config.COOKIE_IS_INTL), url,
+            forceAuthenticatedProfile: true, cancellationToken: FlowCancellation);
         LogDebug("Response: {0}", htmlCode);
         return htmlCode;
     }
 
-    private static async Task<HttpResponseMessage> SendWebRequestAsync(
+    internal static async Task<string> GetIntlAppSourceAsync(
+        string url,
+        HttpClient? httpClient = null,
+        CancellationToken cancellationToken = default,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
+    {
+        // App credentials never share the domestic cookie jar or redirect policy.
+        var json = await ExecuteWebRequestAsync(httpClient ?? IntlApiHttpClient, HttpMethod.Get, url,
+            "Bilibili Freedoooooom/MarkII", Config.COOKIE_IS_INTL, false,
+            (response, token) => response.Content.ReadAsStringAsync(token),
+            cancellationToken.CanBeCanceled ? cancellationToken : FlowCancellation, delay, null,
+            configureRequest: request =>
+            {
+                request.Headers.TryAddWithoutValidation("APP-KEY", "bstar_a");
+                request.Headers.TryAddWithoutValidation("ENV", "prod");
+            });
+        // Successful responses include signed media URLs; leave their contents out of logs.
+        LogDebug("国际站 App 响应: {0} 字符", json.Length);
+        return json;
+    }
+
+    internal static Task<string> GetWebSourceAsync(
+        HttpClient httpClient,
+        string url,
+        string? requestedUserAgent = null,
+        bool sendCookie = true,
+        bool forceAuthenticatedProfile = false,
+        CancellationToken cancellationToken = default,
+        Func<TimeSpan, CancellationToken, Task>? delay = null,
+        Action<string>? log = null,
+        Func<RequestIdentity, RequestIdentity?>? rotateIdentity = null)
+        => ExecuteWebRequestAsync(httpClient, HttpMethod.Get, url, requestedUserAgent, sendCookie,
+            forceAuthenticatedProfile, (response, token) => response.Content.ReadAsStringAsync(token),
+            cancellationToken, delay, log, rotateIdentity);
+
+    private static Task<T> ExecuteWebRequestAsync<T>(
+        HttpClient httpClient,
         HttpMethod method,
         string url,
         string? requestedUserAgent,
         bool sendCookie,
-        bool forceAuthenticatedProfile = false)
+        bool forceAuthenticatedProfile,
+        Func<HttpResponseMessage, CancellationToken, Task<T>> readResponse,
+        CancellationToken cancellationToken,
+        Func<TimeSpan, CancellationToken, Task>? delay,
+        Action<string>? log,
+        Func<RequestIdentity, RequestIdentity?>? rotateIdentity = null,
+        Action<HttpRequestMessage>? configureRequest = null)
     {
-        var firstIdentity = ResolveRequestIdentity(url, requestedUserAgent, sendCookie, forceAuthenticatedProfile);
-        using var webRequest = CreateWebRequest(method, url, firstIdentity, sendCookie);
-        LogDebug("获取网页内容: Url: {0}, Headers: {1}", url, webRequest.Headers);
-        var response = await AppHttpClient.SendAsync(webRequest, HttpCompletionOption.ResponseHeadersRead, FlowCancellation);
-        if (response.StatusCode != HttpStatusCode.PreconditionFailed || requestedUserAgent is not null)
+        // Capture once per logical request; ordinary network retries keep all identity headers.
+        var identity = ResolveRequestIdentity(url, requestedUserAgent, sendCookie, forceAuthenticatedProfile);
+        var riskControlRetried = false;
+        rotateIdentity ??= RotateAutomaticIdentity;
+        return NetworkRetry.ExecuteAsync(async token =>
         {
-            return response;
+            // ResponseHeadersRead leaves body reads outside HttpClient.Timeout. Apply the same
+            // deadline to the entire attempt, including the body and the one permitted 412 retry.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            if (httpClient.Timeout != Timeout.InfiniteTimeSpan) deadline.CancelAfter(httpClient.Timeout);
+            try
+            {
+                while (true)
+                {
+                    using var request = CreateWebRequest(method, url, identity, sendCookie);
+                    configureRequest?.Invoke(request);
+                    LogDebug("获取网页内容: Url: {0}, Headers: {1}", url, request.Headers);
+                    using var response = await httpClient.SendAsync(request,
+                        HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+                    if (response.StatusCode == HttpStatusCode.PreconditionFailed
+                        && requestedUserAgent is null && !riskControlRetried)
+                    {
+                        riskControlRetried = true;
+                        var replacement = rotateIdentity(identity);
+                        if (replacement is not null)
+                        {
+                            LogDebug(identity.BrowserProfile is null
+                                ? "服务端返回HTTP 412，自动更换User-Agent后重试"
+                                : "服务端返回HTTP 412，自动更换完整浏览器请求配置后重试");
+                            identity = replacement.Value;
+                            continue;
+                        }
+                    }
+                    NetworkRetry.EnsureSuccessStatusCode(response);
+                    try
+                    {
+                        return await readResponse(response, deadline.Token);
+                    }
+                    catch (HttpRequestException error) when (IsUnclassifiedResponseReadError(error))
+                    {
+                        // HttpContent wraps a plain transport IOException as Unknown. Only this
+                        // remote body-read boundary can identify it without retrying local IO.
+                        throw new DownloadInterruptedException("HTTP response body was interrupted.", error);
+                    }
+                }
+            }
+            catch (OperationCanceledException error) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+            {
+                throw new OperationCanceledException("HTTP request timed out.",
+                    new TimeoutException("HTTP request timed out.", error), deadline.Token);
+            }
+        }, NetworkRetry.RequestDelays, "获取网页", cancellationToken, delay, log);
+    }
+
+    private static bool IsUnclassifiedResponseReadError(HttpRequestException error)
+    {
+        if (error.HttpRequestError != HttpRequestError.Unknown || error.StatusCode.HasValue
+            || error.InnerException?.GetType() != typeof(IOException)) return false;
+        for (Exception? cause = error.InnerException; cause is not null; cause = cause.InnerException)
+        {
+            // InvalidDataException includes deterministic gzip/deflate corruption. Explicit
+            // protocol errors and cancellation retain their original classification as well.
+            if (cause is InvalidDataException or HttpIOException or HttpRequestException
+                or AuthenticationException or OperationCanceledException) return false;
         }
-
-        var retryIdentity = RotateAutomaticIdentity(firstIdentity);
-        if (retryIdentity is null) return response;
-
-        response.Dispose();
-        LogDebug(firstIdentity.BrowserProfile is null
-            ? "服务端返回HTTP 412，自动更换User-Agent后重试"
-            : "服务端返回HTTP 412，自动更换完整浏览器请求配置后重试");
-        using var retryRequest = CreateWebRequest(method, url, retryIdentity.Value, sendCookie);
-        LogDebug("重试获取网页内容: Url: {0}, Headers: {1}", url, retryRequest.Headers);
-        return await AppHttpClient.SendAsync(retryRequest, HttpCompletionOption.ResponseHeadersRead, FlowCancellation);
+        return true;
     }
 
     internal static void ApplyWebRequestHeaders(
@@ -234,6 +354,7 @@ public static class HTTPUtil
         if (sendCookie) TryAddCookieHeader(request, url);
         if (request.Method == HttpMethod.Get && url.Contains("api.bilibili.com", StringComparison.OrdinalIgnoreCase))
             request.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com/");
+        AddIntlReferer(request, url);
     }
 
     private static HttpRequestMessage CreateWebRequest(
@@ -247,6 +368,7 @@ public static class HTTPUtil
         if (sendCookie) TryAddCookieHeader(request, url);
         if (method == HttpMethod.Get && url.Contains("api.bilibili.com"))
             request.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com/");
+        AddIntlReferer(request, url);
         request.Headers.CacheControl = CacheControlHeaderValue.Parse("no-cache");
         request.Headers.Connection.Clear();
         return request;
@@ -286,11 +408,22 @@ public static class HTTPUtil
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate");
     }
 
+    private static void AddIntlReferer(HttpRequestMessage request, string url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            && (uri.Host.Equals("bilibili.tv", StringComparison.OrdinalIgnoreCase)
+                || uri.Host.EndsWith(".bilibili.tv", StringComparison.OrdinalIgnoreCase)
+                || uri.Host.Equals("biliintl.com", StringComparison.OrdinalIgnoreCase)
+                || uri.Host.EndsWith(".biliintl.com", StringComparison.OrdinalIgnoreCase)))
+            request.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.tv/");
+    }
+
     private static bool IsBilibiliSameSite(string url)
     {
+        var domain = Config.COOKIE_IS_INTL ? "bilibili.tv" : "bilibili.com";
         return Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            && (uri.Host.Equals("bilibili.com", StringComparison.OrdinalIgnoreCase)
-                || uri.Host.EndsWith(".bilibili.com", StringComparison.OrdinalIgnoreCase));
+            && (uri.Host.Equals(domain, StringComparison.OrdinalIgnoreCase)
+                || uri.Host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase));
     }
 
     private static RequestIdentity? RotateAutomaticIdentity(RequestIdentity failedIdentity)
@@ -338,18 +471,46 @@ public static class HTTPUtil
         return retryIdentity;
     }
 
-    private readonly record struct RequestIdentity(
+    internal readonly record struct RequestIdentity(
         string UserAgent,
         BrowserRequestProfile? BrowserProfile);
 
     // 重写重定向处理, 自动跟随多次重定向
     public static async Task<string> GetWebLocationAsync(string url)
     {
-        bool sendCookie = ShouldSendCookie(url);
-        using var webResponse = (await SendWebRequestAsync(HttpMethod.Head, url, null, sendCookie)).EnsureSuccessStatusCode();
-        string location = webResponse.RequestMessage?.RequestUri?.AbsoluteUri ?? url;
+        bool international = Config.COOKIE_IS_INTL;
+        // Resolve international redirects without either an explicit Cookie or a cookie jar.
+        bool sendCookie = !international && ShouldSendCookie(url);
+        string location = await GetWebLocationAsync(GetWebLocationHttpClient(international), url, sendCookie,
+            FlowCancellation);
         LogDebug("Location: {0}", location);
         return location;
+    }
+
+    internal static HttpClient GetWebLocationHttpClient(bool international)
+        => international ? IntlMediaHttpClient : AppHttpClient;
+
+    internal static async Task<string> GetWebLocationAsync(
+        HttpClient httpClient,
+        string url,
+        bool sendCookie = true,
+        CancellationToken cancellationToken = default,
+        Func<TimeSpan, CancellationToken, Task>? delay = null,
+        Action<string>? log = null)
+    {
+        try
+        {
+            return await ExecuteWebRequestAsync(httpClient, HttpMethod.Head, url, null, sendCookie, false,
+                (response, _) => Task.FromResult(response.RequestMessage?.RequestUri?.AbsoluteUri ?? url),
+                cancellationToken, delay, log);
+        }
+        catch (HttpRequestException error) when (error.StatusCode is HttpStatusCode.MethodNotAllowed or HttpStatusCode.NotImplemented)
+        {
+            // Some short-link services only redirect GET; only the final URI is needed.
+            return await ExecuteWebRequestAsync(httpClient, HttpMethod.Get, url, null, sendCookie, false,
+                (response, _) => Task.FromResult(response.RequestMessage?.RequestUri?.AbsoluteUri ?? url),
+                cancellationToken, delay, log);
+        }
     }
 
     public static async Task<byte[]> GetPostResponseAsync(string Url, byte[] postData, Dictionary<string, string>? headers = null)

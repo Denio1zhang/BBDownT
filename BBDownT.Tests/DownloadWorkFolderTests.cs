@@ -133,9 +133,8 @@ public class DownloadWorkFolderTests : IDisposable
     [Fact]
     public void FinishedPageDeletesTheMetadataAndTheEmptyFolder()
     {
+        // 已混流：轨道和它们的续传状态已随输入删除(MediaOutput.DeleteInput)，只剩说明文件
         DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "完成" });
-        // 已合并、已混流：只剩下没有对应文件的校验器
-        File.WriteAllText(Path.Combine(folder, "115050127886063.P1.31783979182.mp4.resume"), "x");
 
         Program.DeleteEmptyDownloadDirectory(folder);
 
@@ -154,49 +153,49 @@ public class DownloadWorkFolderTests : IDisposable
     }
 
     [Fact]
-    public void TrackWaitingForMuxKeepsTheMetadataButAFinishedSkipMuxTrackDoesNot()
+    public void FinishedSkipMuxTrackKeepsItsResumeStateButNotTheMetadata()
     {
+        // 只下载不混流：轨道就是输出；旁边的续传状态保留，重新下载时可直接沿用整条轨道
         var track = Path.Combine(folder, "115050127886063.P1.31783979182.mp4");
         File.WriteAllText(track, "video");
-        File.WriteAllText(track + ".resume", "validator");
-        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "等待混流" });
+        File.WriteAllText(track + ".resume", "state");
+        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "只下载不混流" });
 
-        // 多P：P1 已有输出而跳过，P2 的轨道还在等待混流
-        Program.DeleteEmptyDownloadDirectory(folder);
-        Assert.True(File.Exists(MetadataPath));
+        DownloadWorkFolder.CleanUp(folder);
 
-        // 只下载不混流：轨道就是输出
-        DownloadWorkFolder.FinishTracks(folder, track, "");
-        Assert.False(File.Exists(track + ".resume"));
         Assert.False(File.Exists(MetadataPath));
         Assert.True(File.Exists(track));
+        Assert.True(File.Exists(track + ".resume"));
     }
 
     [Fact]
-    public void FinishedPageDeletesStagedFilesLeftByACrashedMerge()
+    public void StagedFileCountsAsPendingWork()
     {
-        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "合并时崩溃过" });
-        var stale = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
-        File.WriteAllText(stale, "half a track");
-        File.SetLastWriteTimeUtc(stale, DateTime.UtcNow.AddHours(-1));
+        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "合并时中断" });
+        var staged = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
+        File.WriteAllText(staged, "half a track");
 
         Program.DeleteEmptyDownloadDirectory(folder);
 
-        Assert.False(Directory.Exists(folder));
-    }
-
-    [Fact]
-    public void RecentStagedFileCountsAsPendingWork()
-    {
-        DownloadWorkFolder.Begin(folder, new DownloadWorkMetadata { Title = "刚中断" });
-        var recent = Path.Combine(folder, ".115050127886063.P1.31783979182.0123456789abcdef0123456789abcdef.partial.mp4");
-        File.WriteAllText(recent, "half a track");
-
-        Program.DeleteEmptyDownloadDirectory(folder);
-
-        // 不到两分钟、可能还在写入的暂存文件不删；说明文件留着，「已下载文件」仍显示为未完成的下载
-        Assert.True(File.Exists(recent));
+        // 说明文件留着，「已下载文件」仍显示为未完成的下载，删除整组时一并删除暂存文件
+        Assert.True(File.Exists(staged));
         Assert.True(File.Exists(MetadataPath));
+    }
+
+    [Fact]
+    public void ServerTaskNeverWritesTheMetadataThroughALinkedFolder()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var outside = Path.Combine(root, "outside");
+        Directory.CreateDirectory(outside);
+        var restricted = Path.Combine(root, "downloads");
+        Directory.CreateDirectory(restricted);
+        var linked = Path.Combine(restricted, "42");
+        Directory.CreateSymbolicLink(linked, outside);
+
+        Program.BeginWorkFolder(linked, new MyOption { Url = "av42", RestrictedOutputRoot = restricted }, Info(P(1, "42")), P(1, "42"), "", "WEB", null);
+
+        Assert.Empty(Directory.GetFiles(outside));
     }
 
     [Fact]
@@ -218,8 +217,10 @@ public class DownloadWorkFolderTests : IDisposable
     [Theory]
     [InlineData("00000_115050127886063.P1.31783979182.vclip", true)]
     [InlineData("00000_115050127886063.P1.31783979182.vclip.resume", true)]
-    [InlineData("115050127886063.P1.31783979182.mp4.resume", true)]
+    [InlineData("115050127886063.P1.31783979182.mp4.tmp", true)]
     [InlineData("115050127886063.tmp.resume", true)]
+    // 合并好的轨道旁的续传状态不算未完成的工作
+    [InlineData("115050127886063.P1.31783979182.mp4.resume", false)]
     [InlineData("115050127886063.P1.31783979182.mp4", false)]
     [InlineData("foo.resume", false)]
     [InlineData("00000_1.P1.2.vclip", false)]
@@ -229,17 +230,16 @@ public class DownloadWorkFolderTests : IDisposable
         Assert.False(DownloadWorkFolder.IsWorkFileOf(name, "资料"));
     }
 
-    [Fact]
-    public void ConsumedTrackInputsTakeTheirValidatorWithThem()
+    [Theory]
+    [InlineData(".10.P1.20.0123456789abcdef0123456789abcdef.partial.mp4", true, "10.P1.20.mp4")]
+    [InlineData(".[P01]开场.0123456789abcdef0123456789abcdef.partial.mkv", true, "[P01]开场.mkv")]
+    [InlineData(".chapters.0123456789abcdef0123456789abcdef.partial", true, "chapters")]
+    [InlineData("other.partial.mp4", false, "")]
+    [InlineData(".x.0123.partial.mp4", false, "")]
+    public void StagedNames(string name, bool staged, string original)
     {
-        var track = Path.Combine(folder, "a.m4a");
-        File.WriteAllText(track, "audio");
-        File.WriteAllText(track + ".resume", "validator");
-
-        MediaOutput.DeleteInput(track, Path.Combine(root, "out.mp4"));
-
-        Assert.False(File.Exists(track));
-        Assert.False(File.Exists(track + ".resume"));
+        Assert.Equal(staged, DownloadWorkFolder.TryParseStagedName(name, out var parsed));
+        Assert.Equal(original, parsed);
     }
 
     [Theory]

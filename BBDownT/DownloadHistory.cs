@@ -315,7 +315,8 @@ internal static partial class DownloadHistory
         match.Groups["path"] is { Success: true, Value.Length: > 0 } path ? $"{message}：{path.Value}" : message;
 
     private static string RequestedApi(DownloadHistoryRequest request) =>
-        request.UseTvApi == true ? "TV" : request.UseAppApi == true ? "APP" : request.UseIntlApi == true ? "INTL" : "WEB";
+        // 与 Program.GetApiType 相同的优先级
+        request.UseIntlApi == true ? "INTL" : request.UseAppApi == true ? "APP" : request.UseTvApi == true ? "TV" : "WEB";
 
     /// <summary>
     /// 从解析出的输入标识(数字AID、ep:123、cheese:123)或链接里取出 AID、BV号、EP号

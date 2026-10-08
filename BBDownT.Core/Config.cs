@@ -4,6 +4,7 @@ public static class Config
 {
     private static string cookie = "";
     private static string token = "";
+    private static bool cookieIsIntl;
     private static readonly AsyncLocal<CredentialScope?> credentialScope = new();
 
     //For WEB
@@ -14,6 +15,15 @@ public static class Config
         {
             if (credentialScope.Value is { } scope) scope.Cookie = value;
             else cookie = value;
+        }
+    }
+    internal static bool COOKIE_IS_INTL
+    {
+        get => credentialScope.Value is { } scope ? scope.CookieIsIntl : cookieIsIntl;
+        set
+        {
+            if (credentialScope.Value is { } scope) scope.CookieIsIntl = value;
+            else cookieIsIntl = value;
         }
     }
     //For APP/TV
@@ -33,26 +43,29 @@ public static class Config
     /// 作用域内(包括被等待的子方法里)写入的新值，之后在同一作用域内都能读到。
     /// 解析相关的 HOST/EPHOST/TVHOST/AREA 在作用域内同样隔离，并固定从默认值开始：
     /// 下载任务会按自己的参数改写这几个全局值，解析预览不应沿用上一个任务的设置。
+    /// <paramref name="international"/> 是作用域内的 COOKIE_IS_INTL(国际站Cookie)，同样不受并发任务影响。
     /// </summary>
-    public static IDisposable UseCredentials(string cookie, string token)
+    public static IDisposable UseCredentials(string cookie, string token, bool international = false)
     {
         var previous = credentialScope.Value;
-        credentialScope.Value = new CredentialScope(cookie, token);
+        credentialScope.Value = new CredentialScope(cookie, token, international);
         return new ScopeRestorer(() => credentialScope.Value = previous);
     }
 
     /// <summary>
     /// 可变的持有对象：AsyncLocal 只保存引用，子方法里的写入对整个作用域可见
     /// </summary>
-    private sealed class CredentialScope(string cookie, string token)
+    private sealed class CredentialScope(string cookie, string token, bool international)
     {
         private volatile string cookieValue = cookie;
+        private volatile bool cookieIsIntlValue = international;
         private volatile string tokenValue = token;
         private volatile string hostValue = DefaultHost;
         private volatile string epHostValue = DefaultHost;
         private volatile string tvHostValue = DefaultTvHost;
         private volatile string areaValue = "";
         public string Cookie { get => cookieValue; set => cookieValue = value; }
+        public bool CookieIsIntl { get => cookieIsIntlValue; set => cookieIsIntlValue = value; }
         public string Token { get => tokenValue; set => tokenValue = value; }
         public string Host { get => hostValue; set => hostValue = value; }
         public string EpHost { get => epHostValue; set => epHostValue = value; }

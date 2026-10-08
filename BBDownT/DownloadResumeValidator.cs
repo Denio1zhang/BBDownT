@@ -1,6 +1,6 @@
 using System;
-using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
@@ -8,28 +8,28 @@ using System.Threading.Tasks;
 
 namespace BBDownT;
 
-/// <summary>
-/// 断点续传用的远端实体校验器，保存在分片(或临时文件)旁的 .resume 文件里：
-/// 第一行 ETag(Base64)，第二行 Last-Modified，第三行(可选)远端文件总长度。
-/// 下载地址带签名、每次解析都会变，所以只按校验器和总长度判断是不是同一个文件，不比较地址。
-/// </summary>
-/// <param name="TotalLength">远端文件总长度；旧版本写的 .resume 文件没有这一行，为null</param>
-internal sealed record DownloadResumeValidator(string? EntityTag, DateTimeOffset? LastModified, long? TotalLength = null)
+internal sealed record DownloadResumeValidator(string? EntityTag, DateTimeOffset? LastModified)
 {
-    public bool IsUsable => !string.IsNullOrEmpty(EntityTag) || LastModified is not null;
+    public bool HasStrongEntityTag => EntityTagHeaderValue.TryParse(EntityTag, out var tag) && !tag.IsWeak && tag.Tag != "*";
+    public bool IsUsable => HasStrongEntityTag || (string.IsNullOrEmpty(EntityTag) && LastModified is not null);
 
-    public static DownloadResumeValidator FromResponse(HttpResponseMessage response, long? totalLength = null)
+    public static DownloadResumeValidator FromResponse(HttpResponseMessage response, bool allowBareCdnTag = false)
     {
-        return new(
-            response.Headers.ETag is { IsWeak: false } entityTag ? entityTag.ToString() : null,
-            response.Content.Headers.LastModified,
-            totalLength);
+        var tag = response.Headers.ETag is { IsWeak: false, Tag: not "*" } entityTag ? entityTag.ToString() : null;
+        // Some Bili CDNs send an unquoted hexadecimal ETag. Accept this known
+        // spelling only for a recognized media source, and send a quoted If-Range.
+        if (tag is null && allowBareCdnTag && response.Headers.TryGetValues("ETag", out var raw))
+        {
+            var values = raw.ToArray();
+            if (values.Length == 1 && values[0].Length == 32 && values[0].All(Uri.IsHexDigit))
+                tag = $"\"{values[0]}\"";
+        }
+        return new(tag, response.Content.Headers.LastModified);
     }
 
     public void Apply(HttpRequestMessage request)
     {
-        if (!string.IsNullOrEmpty(EntityTag)
-            && EntityTagHeaderValue.TryParse(EntityTag, out var entityTag))
+        if (HasStrongEntityTag && EntityTagHeaderValue.TryParse(EntityTag, out var entityTag))
         {
             request.Headers.IfRange = new RangeConditionHeaderValue(entityTag);
         }
@@ -40,31 +40,7 @@ internal sealed record DownloadResumeValidator(string? EntityTag, DateTimeOffset
     }
 
     public bool Matches(HttpResponseMessage response)
-    {
-        if (!string.IsNullOrEmpty(EntityTag))
-        {
-            return string.Equals(
-                EntityTag,
-                response.Headers.ETag?.ToString(),
-                StringComparison.Ordinal);
-        }
-
-        return LastModified is not null
-            && response.Content.Headers.LastModified == LastModified;
-    }
-
-    /// <summary>
-    /// 与另一个校验器(如本次探测远端文件大小时取得的)是否指向同一个远端实体：
-    /// 有 ETag 时比较 ETag，否则比较 Last-Modified；两边都知道总长度时总长度也要相同
-    /// </summary>
-    public bool SameEntity(DownloadResumeValidator? other)
-    {
-        if (other is null || !IsUsable || !other.IsUsable) return false;
-        if (TotalLength is not null && other.TotalLength is not null && TotalLength != other.TotalLength) return false;
-        if (!string.IsNullOrEmpty(EntityTag) || !string.IsNullOrEmpty(other.EntityTag))
-            return string.Equals(EntityTag, other.EntityTag, StringComparison.Ordinal);
-        return LastModified == other.LastModified;
-    }
+        => Matches(FromResponse(response));
 
     public static async Task<DownloadResumeValidator?> LoadAsync(string path)
     {
@@ -73,64 +49,46 @@ internal sealed record DownloadResumeValidator(string? EntityTag, DateTimeOffset
             return null;
         }
 
-        try
-        {
-            return Parse(await File.ReadAllLinesAsync(path));
-        }
-        catch (IOException)
-        {
-            return null;
-        }
+        return Parse(await File.ReadAllTextAsync(path));
     }
 
-    /// <summary>
-    /// 同步读取(列出已下载文件、合并分片时用)；文件不存在或内容无效时返回null
-    /// </summary>
-    public static DownloadResumeValidator? Load(string path)
+    internal static DownloadResumeValidator? Parse(string text)
     {
-        try
-        {
-            return File.Exists(path) ? Parse(File.ReadAllLines(path)) : null;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            return null;
-        }
-    }
-
-    private static DownloadResumeValidator? Parse(string[] lines)
-    {
-        if (lines.Length is not (2 or 3))
+        if (text.TrimStart().StartsWith('{')) return DownloadResumeState.Parse(text)?.Validator;
+        using var reader = new StringReader(text);
+        var tagLine = reader.ReadLine();
+        var dateLine = reader.ReadLine();
+        if (tagLine is null || dateLine is null || reader.ReadLine() is not null)
         {
             return null;
         }
 
-        var entityTag = Decode(lines[0]);
-        DateTimeOffset? lastModified = DateTimeOffset.TryParse(lines[1], CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed)
+        var entityTag = Decode(tagLine);
+        DateTimeOffset? lastModified = DateTimeOffset.TryParse(dateLine, out var parsed)
             ? parsed
             : null;
-        long? totalLength = lines.Length == 3 && long.TryParse(lines[2], NumberStyles.None, CultureInfo.InvariantCulture, out var total) && total > 0
-            ? total
-            : null;
-        var validator = new DownloadResumeValidator(entityTag, lastModified, totalLength);
+        var validator = new DownloadResumeValidator(entityTag, lastModified);
         return validator.IsUsable ? validator : null;
     }
 
     public async Task SaveAsync(string path)
     {
-        await File.WriteAllLinesAsync(path, Lines());
+        await File.WriteAllLinesAsync(
+            path,
+            [Encode(EntityTag), LastModified?.ToString("O") ?? ""]);
     }
 
-    public void Save(string path)
-    {
-        File.WriteAllLines(path, Lines());
-    }
+    internal bool Matches(DownloadResumeValidator other)
+        => !string.IsNullOrEmpty(EntityTag) ? EntityTag == other.EntityTag
+            : string.IsNullOrEmpty(other.EntityTag) && LastModified is not null && LastModified == other.LastModified;
 
-    private string[] Lines()
-    {
-        string[] lines = [Encode(EntityTag), LastModified?.ToString("O", CultureInfo.InvariantCulture) ?? ""];
-        return TotalLength is long total ? [.. lines, total.ToString(CultureInfo.InvariantCulture)] : lines;
-    }
+    internal bool SameVersionAs(DownloadResumeValidator other)
+        => this == other || (HasStrongEntityTag && other.HasStrongEntityTag && Matches(other));
+
+    internal bool KnownChanged(DownloadResumeValidator other)
+        => !string.IsNullOrEmpty(EntityTag) && !string.IsNullOrEmpty(other.EntityTag) ? EntityTag != other.EntityTag
+            : string.IsNullOrEmpty(EntityTag) && string.IsNullOrEmpty(other.EntityTag)
+                && LastModified is not null && other.LastModified is not null && LastModified != other.LastModified;
 
     private static string Encode(string? value)
     {

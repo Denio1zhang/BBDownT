@@ -21,8 +21,9 @@ public static class Entity
         public string? ownerMid;
         public string bvid
         {
-            get => BilibiliBvConverter.Encode(long.Parse(aid));
+            get => string.IsNullOrEmpty(aid) ? "" : BilibiliBvConverter.Encode(long.Parse(aid));
         }
+        internal string DownloadId => string.IsNullOrEmpty(aid) ? $"intl_{epid}" : aid;
         public List<ViewPoint> points = new();
 
         [SetsRequiredMembers]
@@ -188,6 +189,10 @@ public static class Entity
         public string? lanDoc;
         public int? type;
         public int? aiType;
+
+        // Alternative encodings of one logical subtitle track. This is local
+        // selection metadata, not part of the public subtitle JSON contract.
+        internal string? FormatVariantGroup { get; set; }
 
         public bool IsAi => type.HasValue ? type == 1 : lan.StartsWith("ai-", StringComparison.OrdinalIgnoreCase);
     }

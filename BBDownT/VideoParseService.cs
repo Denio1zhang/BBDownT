@@ -38,7 +38,7 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
         BBDownTUtil.GetAvIdAsync,
         Program.FetchVideoInfoAsync,
         FetchTracksAsync,
-        (option, page) => SubUtil.GetSubtitlesAsync(page.aid, page.cid, page.epid, page.index, option.UseIntlApi),
+        (option, page) => SubUtil.GetSubtitlesAsync(page.DownloadId, page.cid, page.epid, page.index, option.UseIntlApi),
         WebAccount.FetchAsync,
         name =>
         {
@@ -54,17 +54,20 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
         using var cancellation = HTTPUtil.UseCancellation(cancellationToken);
         // 解析过程可能修改选项(如互动视频回退WEB)，不影响调用方
         var option = (ParseRequest)request.CloneOption();
-        var requestedApi = ApiName(option);
+        var requestedApi = Program.GetApiType(option);
 
-        // 只用请求里显式给出的Cookie，或数据目录里保存的网页登录(BBDownT.data)；
+        // 只用请求里显式给出的Cookie，或数据目录里保存的登录(网页 BBDownT.data，国际站 BBDownTIntl.data)；
         // 不借用全局Config.COOKIE，它可能是另一个正在运行的任务自带的Cookie
-        var cookie = (!string.IsNullOrWhiteSpace(option.Cookie) ? option.Cookie : deps.ReadDataFile("BBDownT.data") ?? "").Trim();
+        var cookie = (!string.IsNullOrWhiteSpace(option.Cookie) ? option.Cookie
+            : deps.ReadDataFile(option.UseIntlApi ? IntlCookieStore.FileName : "BBDownT.data") ?? "").Trim();
+        if (option.UseIntlApi && cookie.Length > 0) cookie = IntlCookieStore.Normalize(cookie);
         var tvToken = deps.ReadDataFile("BBDownTTV.data");
         var appToken = deps.ReadDataFile("BBDownTApp.data");
-        var token = NormalizeToken(!string.IsNullOrWhiteSpace(option.AccessToken) ? option.AccessToken
+        // 与下载任务相同：国际站优先于APP/TV接口，不使用TV/APP的access_token
+        var token = option.UseIntlApi ? "" : NormalizeToken(!string.IsNullOrWhiteSpace(option.AccessToken) ? option.AccessToken
             : option.UseTvApi ? tvToken : option.UseAppApi ? appToken : null);
 
-        using var _ = Config.UseCredentials(cookie, token);
+        using var _ = Config.UseCredentials(cookie, token, option.UseIntlApi);
         if (!string.IsNullOrEmpty(cookie)) deps.ConfigureWebProfile();
 
         // 认不出的网址会落到 GetAvIdAsync 的兜底分支(抓取网页再按番剧页面解析)，不能让服务器代为请求任意网址
@@ -83,7 +86,8 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
 
         // null 表示没能查到登录状态(网络错误等)，此时不给出登录相关的提示
         WebAccount? account;
-        try { account = await deps.GetWebAccount(); }
+        // 国际站Cookie不用于B站网页登录状态
+        try { account = option.UseIntlApi ? WebAccount.Anonymous : await deps.GetWebAccount(); }
         catch (Exception e)
         {
             Logger.LogDebug("解析预览获取账号状态失败: {0}", e.Message);
@@ -101,7 +105,7 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
         var dfnPriority = Program.ParseDfnPriority(option);
 
         var tracks = option.SubOnly ? new ParsedResult()
-            : await deps.FetchTracks(option, aidOri, page, firstEncoding ?? "");
+            : await deps.FetchTracks(option, Program.GetIntlPlaybackId(info, aidOri), page, firstEncoding ?? "");
 
         List<Subtitle> subtitles = [];
         if (!option.SkipSubtitle)
@@ -113,8 +117,8 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
         cancellationToken.ThrowIfCancellationRequested();
 
         var web = account ?? WebAccount.Anonymous;
-        var authenticated = option.UseTvApi || option.UseAppApi ? !string.IsNullOrEmpty(token)
-            : option.UseIntlApi ? true
+        var authenticated = option.UseIntlApi ? true
+            : option.UseTvApi || option.UseAppApi ? !string.IsNullOrEmpty(token)
             : web.IsLogin;
         var accountInfo = new ParseAccount(web.IsLogin, web.UserName, web.IsVip, web.VipLabel,
             !string.IsNullOrWhiteSpace(tvToken), !string.IsNullOrWhiteSpace(appToken), authenticated);
@@ -131,15 +135,16 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
         "无法识别的链接或编号。支持 BV/av/ep/ss/md 号、b23.tv 短链和 bilibili.com 视频、番剧、课程链接。";
 
     /// <summary>
-    /// http(s) 链接只接受 bilibili.com、b23.tv、bilibili.tv 及其子域；BV号等非链接输入交给 GetAvIdAsync 判断
+    /// http(s) 链接只接受 bilibili.com、bilibili.tv 及其子域和 b23.tv、bili.im 短链；BV号等非链接输入交给 GetAvIdAsync 判断
     /// </summary>
     internal static bool IsSupportedInput(string? input)
     {
         var value = input?.Trim() ?? "";
         if (!value.StartsWith("http", StringComparison.OrdinalIgnoreCase)) return true;
-        return Uri.TryCreate(value, UriKind.Absolute, out var uri)
-            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-            && BBDownTUtil.IsBilibiliHost(uri.Host, includeShortLink: true);
+        return BBDownTUtil.IsShortLinkUri(value)
+            || (Uri.TryCreate(value, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+                && BBDownTUtil.IsBilibiliHost(uri.Host));
     }
 
     /// <summary>
@@ -185,9 +190,6 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
 
     private static string NormalizeToken(string? token) =>
         string.IsNullOrWhiteSpace(token) ? "" : token.Trim().Replace("access_token=", "");
-
-    internal static string ApiName(MyOption option) =>
-        option.UseTvApi ? "TV" : option.UseAppApi ? "APP" : option.UseIntlApi ? "INTL" : "WEB";
 
     /// <summary>
     /// 列流使用的分P：显式Page > 下载时默认/指定的第一个分P > P1

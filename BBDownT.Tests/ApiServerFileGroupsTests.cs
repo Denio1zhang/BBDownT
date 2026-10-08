@@ -49,7 +49,7 @@ public class ApiServerFileGroupsTests : IDisposable
     }
 
     /// <summary>
-    /// 旧版本留下的中断下载：分片、校验器、封面，没有说明文件
+    /// 旧版本留下的中断下载：分片、续传状态、封面，没有说明文件
     /// </summary>
     private void LegacyWorkFolder(string aid = "115050127886063")
     {
@@ -293,7 +293,7 @@ public class ApiServerFileGroupsTests : IDisposable
             using var response = await client.DeleteAsync(origin + "/files/groups?id=" + Uri.EscapeDataString("w:115050127886063"));
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var result = JsonSerializer.Deserialize(await response.Content.ReadAsStringAsync(), AppJsonSerializerContext.Default.FileGroupDeleteResult)!;
-            // 2个分片、1个校验器、封面和说明文件
+            // 2个分片、1个续传状态、封面和说明文件
             Assert.Equal(new FileGroupDeleteResult(5, 0), result);
             Assert.False(Directory.Exists(Path.Combine(root, "115050127886063")));
             Assert.True(File.Exists(other));

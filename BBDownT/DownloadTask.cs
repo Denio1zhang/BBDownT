@@ -83,17 +83,6 @@ public sealed class DownloadTask
     }
 
     /// <summary>
-    /// 不足一个测速周期的剩余字节：只累计已下载量，不改变速度
-    /// </summary>
-    internal void AddDownloadedBytes(long bytes)
-    {
-        lock (stateLock)
-        {
-            TotalDownloadedBytes += bytes;
-        }
-    }
-
-    /// <summary>
     /// 记录输出文件。相对路径按当前工作目录(任务执行时即任务的下载目录)转成绝对路径，
     /// 与空间投稿TXT清单等其他输出的写法一致
     /// </summary>

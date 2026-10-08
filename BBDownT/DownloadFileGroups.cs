@@ -73,7 +73,7 @@ public sealed record FileGroup
     /// </summary>
     public long TotalBytes { get; init; }
     /// <summary>
-    /// 删除整组时会删除的文件数。已完成的组就是 Files 的个数；未完成的下载还包括分片、.resume 校验器、
+    /// 删除整组时会删除的文件数。已完成的组就是 Files 的个数；未完成的下载还包括分片、.resume 续传状态、
     /// 说明文件和合并中断留下的隐藏暂存文件
     /// </summary>
     public int FileCount { get; init; }
@@ -86,7 +86,7 @@ public sealed record FileGroup
     /// </summary>
     public string? Folder { get; init; }
     /// <summary>
-    /// 组内的文件(不含分片和 .resume 校验器)；未完成的下载还列出合并中断留下的隐藏暂存文件 .&lt;轨道&gt;.&lt;guid&gt;.partial.mp4
+    /// 组内的文件(未完成的下载不含分片和 .resume 续传状态)；未完成的下载还列出合并中断留下的隐藏暂存文件 .&lt;轨道&gt;.&lt;guid&gt;.partial.mp4
     /// </summary>
     public List<DownloadedFile> Files { get; init; } = [];
     public int ClipCount { get; init; }
@@ -112,7 +112,7 @@ public sealed record FileGroup
     internal bool NeedsTitleLookup { get; init; }
 
     /// <summary>
-    /// 组内全部文件(含分片、.resume 校验器和暂存文件，不含说明文件)的相对路径，删除整组时使用；不输出
+    /// 组内全部文件(含分片、.resume 续传状态和暂存文件，不含说明文件)的相对路径，删除整组时使用；不输出
     /// </summary>
     [JsonIgnore]
     internal List<string> MemberPaths { get; init; } = [];
@@ -150,7 +150,7 @@ internal sealed record VideoTitleInfo(string Title, string? Owner, string? Pic, 
 
 /// <summary>
 /// 把下载根目录下的文件按视频分组。规则(先满足的优先)：
-/// 1. 临时工作文件夹(有说明文件 .bbdownt-task.json，或者文件夹名是 av 号、里面有以这个 av 号命名的分片、校验器或暂存文件)
+/// 1. 临时工作文件夹(有说明文件 .bbdownt-task.json，或者文件夹名是 av 号、里面有以这个 av 号命名的分片、临时文件、续传状态或暂存文件)
 ///    里不属于下载历史的文件是一次未完成的下载，整个文件夹一组；
 /// 2. 下载历史记录过的文件按视频(BV号/av号/ep号)分组，同一视频的多次下载合为一组，最新的记录提供标题、封面和时间；
 ///    同一文件夹里同名的字幕、弹幕、封面等附属文件，以及多P文件夹里其他以分P序号开头的音视频(和它们同名的附属文件)也归入这一组；
@@ -163,14 +163,15 @@ internal static partial class DownloadFileGroups
     internal static readonly string[] AudioExtensions = ["m4a", "mp3", "aac", "flac", "eac3", "ec3", "opus", "wav"];
     internal static readonly string[] ImageExtensions = ["jpg", "jpeg", "png", "webp", "gif", "avif"];
     /// <summary>
-    /// 可作为附属文件归入同名视频的扩展名(字幕、弹幕、封面、说明)；音视频文件不会被当作别的视频的附属文件
+    /// 可作为附属文件归入同名视频的扩展名(字幕、弹幕、封面、说明，以及只下载不混流时轨道旁保留的 .resume 续传状态)；
+    /// 音视频文件不会被当作别的视频的附属文件
     /// </summary>
-    internal static readonly string[] SidecarExtensions = ["srt", "ass", "ssa", "vtt", "lrc", "xml", "json", "nfo", "txt", .. ImageExtensions];
+    internal static readonly string[] SidecarExtensions = ["srt", "ass", "ssa", "vtt", "lrc", "xml", "json", "nfo", "txt", "resume", .. ImageExtensions];
 
     /// <param name="files">下载根目录下列出的文件(已排除受保护的文件和隐藏文件)</param>
     /// <param name="history">下载历史，最新的在前</param>
     /// <param name="metadata">临时工作文件夹(相对路径) -&gt; 说明文件内容</param>
-    /// <param name="validatorFor">分片的 .resume 校验器(相对路径)；用来判断分片是否完整</param>
+    /// <param name="stateFor">分片的 .resume 续传状态(相对路径)；用来判断分片是否完整</param>
     /// <param name="isActive">(文件夹, av号, 最新修改时间) -&gt; 是否正在下载</param>
     /// <param name="titleFor">av号 -&gt; 已查到的视频信息，以及是否正在查询</param>
     /// <param name="hiddenFiles">下载流程产生的隐藏文件：说明文件和合并中断留下的暂存文件；只归入未完成的下载</param>
@@ -178,13 +179,12 @@ internal static partial class DownloadFileGroups
         IReadOnlyList<ListedFile> files,
         IReadOnlyList<DownloadHistoryEntry> history,
         IReadOnlyDictionary<string, DownloadWorkMetadata> metadata,
-        Func<string, DownloadResumeValidator?>? validatorFor = null,
+        Func<string, DownloadResumeState?>? stateFor = null,
         Func<string, string?, long, bool>? isActive = null,
         Func<string, (VideoTitleInfo? Info, bool Pending)>? titleFor = null,
-        int clipSize = BBDownTDownloadUtil.DefaultClipSize,
         IReadOnlyList<ListedFile>? hiddenFiles = null)
     {
-        validatorFor ??= _ => null;
+        stateFor ??= _ => null;
         isActive ??= (_, _, _) => false;
         titleFor ??= _ => (null, false);
         var byPath = new Dictionary<string, ListedFile>(StringComparer.Ordinal);
@@ -271,7 +271,7 @@ internal static partial class DownloadFileGroups
             var hidden = hiddenByDir.GetValueOrDefault(dir) ?? [];
             if (members.Count == 0 && hidden.Count == 0) continue;
             foreach (var file in members) owner[file.Path] = "w:" + dir;
-            groups.Add(WorkGroup(dir, members, hidden, metadata.GetValueOrDefault(dir), validatorFor, isActive, titleFor, clipSize));
+            groups.Add(WorkGroup(dir, members, hidden, metadata.GetValueOrDefault(dir), stateFor, isActive, titleFor));
         }
 
         // 4. 其余文件：多P文件夹里分P序号开头的音视频和同名附属文件一组，其他按文件名分组
@@ -360,44 +360,31 @@ internal static partial class DownloadFileGroups
     }
 
     private static FileGroup WorkGroup(string dir, List<ListedFile> members, List<ListedFile> hidden, DownloadWorkMetadata? metadata,
-        Func<string, DownloadResumeValidator?> validatorFor, Func<string, string?, long, bool> isActive,
-        Func<string, (VideoTitleInfo? Info, bool Pending)> titleFor, int clipSize)
+        Func<string, DownloadResumeState?> stateFor, Func<string, string?, long, bool> isActive,
+        Func<string, (VideoTitleInfo? Info, bool Pending)> titleFor)
     {
         var paths = members.Select(file => file.Path).ToHashSet(StringComparer.Ordinal);
-        var clips = new List<(ListedFile File, ClipFileName Name, bool HasValidatorFile, DownloadResumeValidator? Validator)>();
+        var clips = new List<(ListedFile File, ClipFileName Name)>();
         var others = new List<ListedFile>();
         foreach (var file in members)
         {
             var name = NameOf(file.Path);
             if (name.EndsWith(".resume", StringComparison.Ordinal)) continue;
-            if (DownloadWorkFolder.TryParseClip(name, out var clip))
-            {
-                var hasValidator = paths.Contains(file.Path + ".resume");
-                clips.Add((file, clip, hasValidator, hasValidator ? validatorFor(file.Path + ".resume") : null));
-            }
-            else
-            {
-                others.Add(file);
-            }
+            if (DownloadWorkFolder.TryParseClip(name, out var clip)) clips.Add((file, clip));
+            else others.Add(file);
         }
         // 合并分片或混流中断留下的隐藏暂存文件也列出来(可能有整条轨道那么大)；说明文件只计数，不列出
-        var staged = hidden.Where(file => MediaOutput.TryParseStagedName(NameOf(file.Path), out _)).ToList();
+        var staged = hidden.Where(file => DownloadWorkFolder.TryParseStagedName(NameOf(file.Path), out _)).ToList();
         others.AddRange(staged);
 
-        // 每条轨道：最后一段的序号、是否有分片带校验器、校验器记下的远端总长度
-        var tracks = clips.GroupBy(clip => (clip.Name.TrackBase, clip.Name.IsVideo))
-            .ToDictionary(group => group.Key, group => (
-                LastIndex: group.Max(clip => clip.Name.Index),
-                HasValidators: group.Any(clip => clip.HasValidatorFile),
-                Total: group.Select(clip => clip.Validator?.TotalLength).FirstOrDefault(total => total is not null)));
+        // 分片完整：续传状态记下这一段已下载完整，且本地文件就是记下的长度
         var clipList = clips
             .OrderBy(clip => clip.Name.IsVideo ? 0 : 1).ThenBy(clip => clip.Name.Page ?? 0)
             .ThenBy(clip => clip.Name.TrackBase, StringComparer.Ordinal).ThenBy(clip => clip.Name.Index)
             .Select(clip =>
             {
-                var track = tracks[(clip.Name.TrackBase, clip.Name.IsVideo)];
-                var complete = IsCompleteClip(clip.File.Size, clip.Name.Index, clip.Validator?.TotalLength ?? track.Total,
-                    clip.HasValidatorFile, track.HasValidators, track.LastIndex, clipSize);
+                var complete = clip.File.Size > 0 && paths.Contains(clip.File.Path + ".resume")
+                    && stateFor(clip.File.Path + ".resume") is { Complete: true } state && state.LocalLength == clip.File.Size;
                 return new FileClip(clip.File.Path, clip.Name.IsVideo ? "video" : "audio", clip.Name.Index, clip.Name.Page, clip.File.Size, complete);
             })
             .ToList();
@@ -448,24 +435,6 @@ internal static partial class DownloadFileGroups
             Request = metadata?.Request is { Url.Length: > 0 } request ? request : null,
             MemberPaths = members.Concat(staged).Select(file => file.Path).OrderBy(path => path, StringComparer.Ordinal).ToList(),
         };
-    }
-
-    /// <summary>
-    /// 分片是否已下载完整。知道远端总长度(这一段或同一轨道其他分片的校验器记下的)时按这一段应有的长度判断；
-    /// 否则标准大小的分片算完整。不足标准大小、没有校验器的最后一段：旧版本在分片下载完成时删除校验器，
-    /// 所以同一轨道还有分片带校验器时它是下载完成的最后一段；整条轨道都没有校验器(更早的版本或别的工具)时无法确认，算未完成
-    /// </summary>
-    internal static bool IsCompleteClip(long size, int index, long? trackTotal, bool hasValidatorFile, bool trackHasValidators,
-        int lastIndex, int clipSize)
-    {
-        if (size <= 0) return false;
-        if (trackTotal is long total)
-        {
-            var expected = Math.Min(clipSize, total - (long)index * clipSize);
-            return expected > 0 && size == expected;
-        }
-        if (size == clipSize) return true;
-        return !hasValidatorFile && trackHasValidators && index == lastIndex && size < clipSize;
     }
 
     private static string? BvidFor(string? aid)

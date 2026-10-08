@@ -9,8 +9,10 @@ using System.Threading.Tasks;
 using static BBDownT.Core.Entity.Entity;
 using static BBDownT.Core.Logger;
 using static BBDownT.Core.Util.HTTPUtil;
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Threading;
+using System.Runtime.ExceptionServices;
+using BBDownT.Core.Util;
 
 namespace BBDownT;
 
@@ -23,307 +25,288 @@ internal static class BBDownTDownloadUtil
         public bool ForceHttp { get; set; } = false;
         public bool MultiThread { get; set; } = false;
         public DownloadTask? RelatedTask { get; set; } = null;
+        internal string? RestrictedOutputRoot { get; set; }
+        internal string? ResourceIdentity { get; set; }
+        internal bool IsBilibiliMedia { get; set; }
+        internal Func<TimeSpan, CancellationToken, Task>? RetryDelay { get; set; }
+        internal CancellationToken CancellationToken { get; set; }
+        internal int? MaxParallelDownloads { get; set; }
     }
-
-    /// <summary>
-    /// 多线程分片的续传设置
-    /// </summary>
-    internal sealed class ClipResumeOptions
-    {
-        /// <summary>
-        /// 分片下载完成后保留 .resume 校验器：中断后再次下载时，整段已完成的分片经远端校验一致即可直接沿用；
-        /// 整条轨道合并成功后由 <see cref="MergeTrackClips"/> 删除
-        /// </summary>
-        public bool KeepValidator { get; init; }
-
-        /// <summary>
-        /// 旧版本留下的完整分片没有自己的校验器(下载完成时被删除了)。同一轨道其他分片的校验器与本次远端文件一致时，
-        /// 传入本次探测到的远端校验器，用它校验这类分片；末尾抽样字节也必须与远端一致才沿用
-        /// </summary>
-        public DownloadResumeValidator? LegacyValidator { get; init; }
-
-        /// <summary>
-        /// 沿用已有字节时调用：参数为沿用的字节数，以及是否整段沿用(否则是从中途续传)。
-        /// 进度条据此不把这些字节算进下载速度和本次下载量
-        /// </summary>
-        public Action<long, bool>? OnReused { get; init; }
-    }
-
-    /// <summary>
-    /// 默认分片大小(20 MiB)
-    /// </summary>
-    internal const int DefaultClipSize = 20 * 1024 * 1024;
-
-    /// <summary>
-    /// 校验完整旧分片时从远端读取并与本地比较的末尾字节数
-    /// </summary>
-    internal const int ClipSampleBytes = 64;
-
-    /// <summary>
-    /// 分片下载失败后重试前的等待(第 n 次重试等 n 倍)
-    /// </summary>
-    internal static readonly TimeSpan ClipRetryDelay = TimeSpan.FromMilliseconds(500);
 
     internal static async Task RangeDownloadToTmpAsync(
-        int id,
-        string url,
-        string tmpName,
-        long fromPosition,
-        long? toPosition,
-        Action<int, long, long> onProgress,
-        bool failOnRangeNotSupported = false,
-        HttpClient? httpClient = null,
-        ClipResumeOptions? resume = null)
+        int id, string url, string tmpName, long fromPosition, long? toPosition,
+        Action<int, long, long> onProgress, bool failOnRangeNotSupported = false,
+        HttpClient? httpClient = null, string? restrictedOutputRoot = null,
+        string? resourceIdentity = null, DownloadResourceMetadata? expectedResource = null,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null, CancellationToken cancellationToken = default,
+        string? sourceObjectHash = null, Action<int, DownloadProgressUpdate>? onTransferProgress = null)
     {
-        var client = httpClient ?? AppHttpClient;
-        var validatorPath = tmpName + ".resume";
-        var resumeValidator = await DownloadResumeValidator.LoadAsync(validatorPath);
-        if (toPosition is long clipEnd && clipEnd >= fromPosition && FileLength(tmpName) == clipEnd - fromPosition + 1)
+        cancellationToken.ThrowIfCancellationRequested();
+        tmpName = OutputPathPolicy.ResolveArtifact(tmpName, restrictedOutputRoot);
+        var validatorPath = OutputPathPolicy.ResolveArtifact(tmpName + ".resume", restrictedOutputRoot);
+        var identity = DownloadResumeState.Scope(url, resourceIdentity);
+        var sourceHash = DownloadResumeState.SourceHash(url);
+        sourceObjectHash ??= resourceIdentity is not null ? DownloadMediaSource.CreateObjectHash(url) : null;
+        var state = await DownloadResumeState.LoadAsync(validatorPath);
+        var legacyValidator = state is null ? await DownloadResumeValidator.LoadAsync(validatorPath) : null;
+        await using var local = new FileStream(tmpName, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None,
+            262144, FileOptions.Asynchronous);
+        var existing = local.Length;
+        var localMatches = state is not null && state.MatchesRange(identity, fromPosition, toPosition)
+            && await state.MatchesStreamAsync(local);
+        var sameSource = localMatches && state!.MatchesSource(url, sourceObjectHash);
+        var fullCheckpoint = localMatches && existing == state!.LocalLength && existing == state.RangeLength;
+        if (fullCheckpoint && sameSource && state!.Validator.IsUsable
+            && (state.Complete || toPosition is not null || expectedResource is not null))
         {
-            // 完整的旧分片：远端仍是同一个文件(校验器与总长度一致)、且末尾抽样字节相同时直接沿用；
-            // 没有校验器或确认远端已变化时从头重新下载，避免把不同画质、编码或已更新的文件拼在一起。
-            // 无法确认(限流、5xx、连接中断等)时 ConfirmCompleteClipAsync 抛出异常，由外层重试，不动本地分片和校验器
-            var clipLength = clipEnd - fromPosition + 1;
-            var candidate = resumeValidator ?? resume?.LegacyValidator;
-            var confirmed = candidate is null
-                ? null
-                : await ConfirmCompleteClipAsync(client, url, tmpName, fromPosition, clipEnd, candidate);
-            if (confirmed is not null)
+            // A complete part still needs remote validation. Multi-thread callers
+            // share one header probe; direct callers perform their own probe.
+            expectedResource ??= await TryGetResourceMetadataAsync(url, httpClient, cancellationToken, retryDelay);
+            if (expectedResource is not null && state.TotalLength == expectedResource.TotalLength
+                && state.Validator.Matches(expectedResource.Validator))
             {
-                if (resume?.KeepValidator == true)
-                {
-                    if (confirmed != resumeValidator) await confirmed.SaveAsync(validatorPath);
-                }
-                else
-                {
-                    File.Delete(validatorPath);
-                }
-                resume?.OnReused?.Invoke(clipLength, true);
-                onProgress(id, clipLength, clipEnd + 1);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!state.Complete || state.SourceUriHash != sourceHash || state.SourceObjectHash != sourceObjectHash)
+                    await (state with { Complete = true, SourceUriHash = sourceHash, SourceObjectHash = sourceObjectHash })
+                        .SaveAsync(validatorPath, restrictedOutputRoot);
+                onProgress(id, existing, state.TotalLength);
+                onTransferProgress?.Invoke(id, new(existing, 0) { TotalLength = state.TotalLength });
                 return;
             }
-            File.Delete(validatorPath);
-            resumeValidator = null;
-            await File.WriteAllBytesAsync(tmpName, []);
         }
-
-        var restarted = false;
-        while (true)
+        var changedVersion = expectedResource is not null && localMatches && sameSource
+            && (state!.TotalLength != expectedResource.TotalLength
+                || state.Validator.KnownChanged(expectedResource.Validator));
+        var invalidState = state is not null && !localMatches;
+        var boundedFull = toPosition is not null && (localMatches ? state!.LocalLength : existing) >= toPosition - fromPosition + 1;
+        var append = sameSource && !state!.Complete && !boundedFull && !changedVersion
+            && state.Validator.IsUsable && (expectedResource is null || state.Validator.Matches(expectedResource.Validator));
+        var comparePrefix = existing > 0 && !append && !invalidState && !changedVersion;
+        if (append && existing > state!.LocalLength) comparePrefix = true;
+        var retainedLength = append ? state!.LocalLength : 0;
+        var requestedFrom = append ? checked(fromPosition + retainedLength) : fromPosition;
+        var international = BBDownT.Core.Config.COOKIE_IS_INTL;
+        using var request = MediaRequestPolicy.CreateRequest(url, international, requestedFrom, toPosition);
+        var requestValidator = expectedResource?.Validator ?? (sameSource ? state!.Validator : legacyValidator);
+        if (requestValidator is { IsUsable: true }) requestValidator.Apply(request);
+        var client = httpClient ?? GetMediaHttpClient(international);
+        using var response = await SendMediaRequestAsync(client, request, cancellationToken);
+        if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
         {
-            using var fileStream = new FileStream(tmpName, FileMode.OpenOrCreate);
-            fileStream.Seek(0, SeekOrigin.End);
-            if (fileStream.Position > 0 && resumeValidator is null)
+            var length = response.Content.Headers.ContentRange?.Length;
+            if (append && toPosition is null && length == requestedFrom && state!.TotalLength == length
+                && state.Validator.Matches(DownloadResumeValidator.FromResponse(response, sourceObjectHash is not null)))
             {
-                fileStream.SetLength(0);
-                fileStream.Position = 0;
+                local.SetLength(retainedLength);
+                await local.FlushAsync();
+                await (state with { Complete = true, SourceUriHash = sourceHash, SourceObjectHash = sourceObjectHash })
+                    .SaveAsync(validatorPath, restrictedOutputRoot);
+                onProgress(id, retainedLength, length.Value);
+                onTransferProgress?.Invoke(id, new(retainedLength, 0) { TotalLength = length.Value });
+                return;
             }
-            if (toPosition > 0 && fileStream.Position >= toPosition - fromPosition + 1)
+            throw new IOException("续传范围或远端版本已变化，已保留本地数据，请重新解析后重试");
+        }
+        if (response.StatusCode == HttpStatusCode.PreconditionFailed)
+            throw new IOException("续传校验条件已变化，已保留本地数据，请重新解析后重试");
+        NetworkRetry.EnsureSuccessStatusCode(response);
+        var remoteValidator = DownloadResumeValidator.FromResponse(response, sourceObjectHash is not null);
+        var responseLength = response.Content.Headers.ContentLength;
+        long totalLength;
+        if (response.StatusCode == HttpStatusCode.PartialContent)
+        {
+            responseLength = ValidatePartialContentRange(response.Content.Headers.ContentRange,
+                responseLength, requestedFrom, toPosition);
+            totalLength = response.Content.Headers.ContentRange!.Length ?? 0;
+            if (totalLength <= 0) throw new InvalidDataException("分片响应未提供有效的总长度");
+            if (append && !state!.Validator.Matches(remoteValidator))
             {
-                // 长度不对的旧分片(正常不会出现)：从头请求可避免跨版本拼接
-                fileStream.SetLength(0);
-                fileStream.Position = 0;
-                resumeValidator = null;
+                if (state.Validator.KnownChanged(remoteValidator))
+                    throw new InvalidDataException("续传响应的远端实体校验器已变化，已保留本地数据");
+                // A stronger validator appearing is not evidence that the old
+                // bytes match it. Re-read the complete local prefix first.
+                response.Dispose();
+                await local.DisposeAsync();
+                await RangeDownloadToTmpAsync(id, url, tmpName, fromPosition, toPosition, onProgress,
+                    failOnRangeNotSupported, httpClient, restrictedOutputRoot, resourceIdentity,
+                    new(totalLength, remoteValidator), retryDelay, cancellationToken, sourceObjectHash, onTransferProgress);
+                return;
             }
-            var existingLength = fileStream.Position;
-            var downloadedBytes = fromPosition + existingLength;
-            // 校验器只有 Last-Modified(没有强 ETag)时，同一秒生成的另一个文件也会被 If-Range 当成同一个：
-            // 从已下载部分的末尾往前多请求几十个字节，与本地末尾比对一致才接着追加
-            var overlap = existingLength > 0 && resumeValidator is not null && string.IsNullOrEmpty(resumeValidator.EntityTag)
-                ? (int)Math.Min(ClipSampleBytes, existingLength)
-                : 0;
-
-            using var httpRequestMessage = CreateMediaRequest(url);
-            httpRequestMessage.Headers.Range = new(downloadedBytes - overlap, toPosition);
-            if (existingLength > 0)
+        }
+        else if (response.StatusCode == HttpStatusCode.OK)
+        {
+            if (failOnRangeNotSupported && (requestedFrom > 0 || toPosition is not null))
+                throw new NotSupportedException("Range request is not supported.");
+            if (fromPosition != 0) throw new NotSupportedException("Range request is not supported.");
+            totalLength = responseLength ?? 0;
+            // If-Range yielding 200 replaces the old representation rather than
+            // appending a whole object at the old offset.
+            if (append) { append = false; comparePrefix = false; }
+        }
+        else throw new InvalidDataException($"不支持的下载响应状态: {(int)response.StatusCode}");
+        if (expectedResource is not null)
+        {
+            if (totalLength != expectedResource.TotalLength)
+                throw new InvalidDataException("分片响应与本次资源探测的长度不一致");
+            if (expectedResource.Validator.IsUsable && !expectedResource.Validator.Matches(remoteValidator))
             {
-                resumeValidator?.Apply(httpRequestMessage);
-            }
-
-            using var response = await client.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
-            if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-            {
-                var remoteLength = response.Content.Headers.ContentRange?.Length;
-                if (existingLength > 0
-                    && remoteLength == downloadedBytes
-                    && resumeValidator is not null
-                    && resumeValidator.Matches(response))
+                if (string.IsNullOrEmpty(expectedResource.Validator.EntityTag) && !string.IsNullOrEmpty(remoteValidator.EntityTag))
                 {
-                    if (resume?.KeepValidator != true) File.Delete(validatorPath);
-                    resume?.OnReused?.Invoke(existingLength, false);
-                    onProgress(id, existingLength, downloadedBytes);
+                    response.Dispose();
+                    await local.DisposeAsync();
+                    await RangeDownloadToTmpAsync(id, url, tmpName, fromPosition, toPosition, onProgress,
+                        failOnRangeNotSupported, httpClient, restrictedOutputRoot, resourceIdentity,
+                        new(totalLength, remoteValidator), retryDelay, cancellationToken, sourceObjectHash, onTransferProgress);
                     return;
                 }
-
-                fileStream.SetLength(0);
-                fileStream.Position = 0;
-                File.Delete(validatorPath);
-                throw new IOException("续传位置不再有效，已清空临时文件以便重试");
+                throw new InvalidDataException("分片响应与本次资源探测的版本不一致");
             }
-            response.EnsureSuccessStatusCode();
-            long? responseContentLength = response.Content.Headers.ContentLength;
-            long? entityLength;
-
-            if (response.StatusCode == HttpStatusCode.OK) // server doesn't response a partial content
+        }
+        // No truncation happens until a successful, correctly ranged response.
+        if (!append && !comparePrefix) { local.SetLength(0); existing = 0; }
+        using var remote = await ReadRemoteAsync(token => new ValueTask<Stream>(response.Content.ReadAsStreamAsync(token)),
+            client.Timeout, cancellationToken);
+        await CopyVerifiedRangeAsync(local, remote, append ? retainedLength : 0,
+            comparePrefix, responseLength, bytes => onProgress(id, bytes, totalLength > 0 ? totalLength : bytes),
+            async (length, hash, complete) =>
             {
-                if (existingLength > 0 && toPosition is not null && !restarted)
+                if (totalLength <= 0 && !complete) return;
+                if (totalLength <= 0) totalLength = fromPosition + length;
+                await new DownloadResumeState(identity, sourceHash, fromPosition, toPosition,
+                    totalLength, complete, length, hash, remoteValidator)
+                    { SourceObjectHash = sourceObjectHash }
+                    .SaveAsync(validatorPath, restrictedOutputRoot);
+            }, client.Timeout, cancellationToken,
+            update => onTransferProgress?.Invoke(id, update with { TotalLength = totalLength }),
+            checkpointVerifiedPrefix: remoteValidator.HasStrongEntityTag);
+    }
+
+    // The same streaming state machine is exercised with MemoryStreams in tests.
+    // Without a validator (or after an unrecognized source change), every retained byte
+    // must match the new response before any suffix is appended.
+    internal static async Task CopyVerifiedRangeAsync(Stream local, Stream remote,
+        long appendLength, bool comparePrefix, long? responseLength, Action<long> progress,
+        Func<long, string, bool, Task> checkpoint, TimeSpan? readTimeout = null,
+        CancellationToken cancellationToken = default, Action<DownloadProgressUpdate>? onTransferProgress = null,
+        bool checkpointVerifiedPrefix = false)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[262144];
+        var comparison = new byte[buffer.Length];
+        var originalLength = local.Length;
+        var position = appendLength;
+        if (appendLength > 0)
+        {
+            local.Position = 0;
+            long remaining = appendLength;
+            while (remaining > 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var read = await local.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)));
+                if (read == 0) throw new IOException("本地续传文件读取不完整");
+                hash.AppendData(buffer, 0, read);
+                remaining -= read;
+            }
+        }
+        var replaced = !comparePrefix;
+        var retainedProgress = comparePrefix ? originalLength : appendLength;
+        if (responseLength is { } expectedLength) retainedProgress = Math.Min(retainedProgress, checked(appendLength + expectedLength));
+        var verificationLength = comparePrefix ? Math.Max(0, retainedProgress - appendLength) : 0;
+        onTransferProgress?.Invoke(new(retainedProgress, 0, verificationLength > 0, 0, verificationLength));
+        var received = 0L;
+        var savedAt = position;
+        async Task SaveAsync(bool complete)
+        {
+            // A strong validator lets the next request start after the verified
+            // prefix. LocalLength marks its boundary; the unchecked tail stays
+            // on disk and is compared before it can be reused.
+            if (!replaced && position < originalLength
+                && (!checkpointVerifiedPrefix || position == appendLength)) return;
+            await local.FlushAsync();
+            await checkpoint(position, Convert.ToHexString(hash.GetCurrentHash()), complete);
+            savedAt = position;
+        }
+        try
+        {
+            while (responseLength is null || received < responseLength)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var count = (int)Math.Min(buffer.Length, responseLength is null ? buffer.Length : responseLength.Value - received);
+                var read = await ReadRemoteAsync(token => remote.ReadAsync(buffer.AsMemory(0, count), token),
+                    readTimeout, cancellationToken);
+                if (read == 0) break;
+                var retained = !replaced ? (int)Math.Min(read, Math.Max(0, originalLength - position)) : 0;
+                if (retained > 0)
                 {
-                    // If-Range 发现远端文件已变化，服务器返回了整个文件：清空这一段，改用普通范围请求从头下载
-                    fileStream.SetLength(0);
-                    File.Delete(validatorPath);
-                    resumeValidator = null;
-                    restarted = true;
-                    continue;
+                    local.Position = position;
+                    await local.ReadExactlyAsync(comparison.AsMemory(0, retained));
+                    if (!buffer.AsSpan(0, retained).SequenceEqual(comparison.AsSpan(0, retained)))
+                    {
+                        verificationLength = Math.Max(0, position - appendLength);
+                        local.SetLength(position);
+                        retained = 0;
+                        replaced = true;
+                    }
                 }
-                if (failOnRangeNotSupported && (downloadedBytes > 0 || toPosition != null)) throw new NotSupportedException("Range request is not supported.");
-                downloadedBytes = 0;
-                existingLength = 0;
-                fileStream.SetLength(0);
-                fileStream.Position = 0;
-                entityLength = responseContentLength;
-            }
-            else if (response.StatusCode == HttpStatusCode.PartialContent)
-            {
-                var contentRange = response.Content.Headers.ContentRange;
-                if (existingLength > 0 && resumeValidator is not null
-                    && (!resumeValidator.Matches(response)
-                        || (resumeValidator.TotalLength is long expectedTotal && contentRange?.Length is long remoteTotal && remoteTotal != expectedTotal)))
+                if (retained < read)
                 {
-                    if (restarted) throw new InvalidDataException("续传响应的远端实体校验器已变化");
-                    // 服务器没有按 If-Range 处理、但远端文件已变化：清空这一段后从头下载
-                    fileStream.SetLength(0);
-                    File.Delete(validatorPath);
-                    resumeValidator = null;
-                    restarted = true;
-                    continue;
+                    local.Position = position + retained;
+                    await local.WriteAsync(buffer.AsMemory(retained, read - retained));
                 }
-                responseContentLength = ValidatePartialContentRange(
-                    contentRange,
-                    responseContentLength,
-                    downloadedBytes - overlap,
-                    toPosition);
-                entityLength = contentRange?.Length;
+                hash.AppendData(buffer, 0, read);
+                position += read;
+                received += read;
+                progress(position);
+                onTransferProgress?.Invoke(new(!replaced ? Math.Max(position, retainedProgress) : position, read,
+                    !replaced && position < retainedProgress, Math.Min(verificationLength, position - appendLength), verificationLength));
+                if (position - savedAt >= 4 * 1024 * 1024) await SaveAsync(false);
             }
-            else
-            {
-                throw new InvalidDataException($"不支持的下载响应状态: {(int)response.StatusCode}");
-            }
-
-            using var stream = await response.Content.ReadAsStreamAsync();
-            if (overlap > 0 && response.StatusCode == HttpStatusCode.PartialContent)
-            {
-                // 重叠的字节读不全时抛出 EndOfStreamException，由外层重试
-                var remoteOverlap = new byte[overlap];
-                await stream.ReadExactlyAsync(remoteOverlap);
-                var localOverlap = new byte[overlap];
-                fileStream.Seek(-overlap, SeekOrigin.End);
-                await fileStream.ReadExactlyAsync(localOverlap);
-                fileStream.Seek(0, SeekOrigin.End);
-                if (!remoteOverlap.AsSpan().SequenceEqual(localOverlap))
-                {
-                    if (restarted) throw new InvalidDataException("续传位置之前的字节与远端不一致");
-                    // 远端已是另一个文件(只是 Last-Modified 相同)：清空这一段后从头下载
-                    fileStream.SetLength(0);
-                    File.Delete(validatorPath);
-                    resumeValidator = null;
-                    restarted = true;
-                    continue;
-                }
-                responseContentLength -= overlap;
-            }
-
-            var responseValidator = DownloadResumeValidator.FromResponse(response, entityLength);
-            if (responseValidator.IsUsable)
-            {
-                await responseValidator.SaveAsync(validatorPath);
-            }
-            else
-            {
-                File.Delete(validatorPath);
-            }
-            if (existingLength > 0) resume?.OnReused?.Invoke(existingLength, false);
-
-            var totalBytes = downloadedBytes + (responseContentLength ?? long.MaxValue - downloadedBytes);
-
-            const int blockSize = 1048576 / 4;
-            var buffer = new byte[blockSize];
-
-            while (downloadedBytes < totalBytes)
-            {
-                var recevied = await stream.ReadAsync(buffer);
-                if (recevied == 0) break;
-                await fileStream.WriteAsync(buffer.AsMemory(0, recevied));
-                await fileStream.FlushAsync();
-                downloadedBytes += recevied;
-                onProgress(id, downloadedBytes - fromPosition, totalBytes);
-            }
-
-            var expectedTempLength = GetExpectedTempLength(existingLength, responseContentLength);
-            if (expectedTempLength != null && expectedTempLength != fileStream.Length)
-                throw new Exception("Retry...");
-            if (resume?.KeepValidator != true) File.Delete(validatorPath);
-            return;
+            if (responseLength is not null && received != responseLength)
+                throw new DownloadInterruptedException("下载响应提前结束，已保留已验证的数据",
+                    new EndOfStreamException("远端响应未达到声明长度"));
+            local.SetLength(position);
+            replaced = true;
+            await SaveAsync(true);
+            onTransferProgress?.Invoke(new(position, 0, false, verificationLength, verificationLength));
+        }
+        catch
+        {
+            await SaveAsync(false);
+            throw;
         }
     }
 
-    /// <summary>
-    /// 校验一个完整的旧分片(或合并好的整条轨道)是否仍是远端的同一个文件：带 If-Range 请求末尾的几个字节。结果有三种：
-    /// 1. 沿用：返回 206、校验器一致、总长度一致(已知时)，并且这几个字节与本地文件末尾相同，返回带总长度的校验器；
-    /// 2. 已变化：带 If-Range 返回 200(服务器确认远端文件已变化)，或返回 206 但校验器、总长度、抽样字节不一致，返回null，由调用方重新下载；
-    /// 3. 无法确认：其他状态码(403/404/416/429/5xx 等)、Content-Range 不符合请求、响应体没读完、网络错误，
-    ///    抛出 HttpRequestException/InvalidDataException/IOException，由调用方重试，本地文件和校验器保持不动
-    /// </summary>
-    internal static async Task<DownloadResumeValidator?> ConfirmCompleteClipAsync(HttpClient client, string url, string localPath,
-        long fromPosition, long toPosition, DownloadResumeValidator validator)
+    private static async Task<T> ReadRemoteAsync<T>(Func<CancellationToken, ValueTask<T>> read,
+        TimeSpan? readTimeout, CancellationToken cancellationToken)
     {
-        var sampleLength = (int)Math.Min(ClipSampleBytes, toPosition - fromPosition + 1);
-        var sampleFrom = toPosition - sampleLength + 1;
-        using var request = CreateMediaRequest(url);
-        request.Headers.Range = new(sampleFrom, toPosition);
-        validator.Apply(request);
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-        if (response.StatusCode == HttpStatusCode.OK && request.Headers.IfRange is not null) return null;
-        if (response.StatusCode != HttpStatusCode.PartialContent)
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (readTimeout is { } timeout && timeout != Timeout.InfiniteTimeSpan) deadline.CancelAfter(timeout);
+        try { return await read(deadline.Token); }
+        catch (OperationCanceledException error) when (!cancellationToken.IsCancellationRequested && deadline.IsCancellationRequested)
         {
-            throw new HttpRequestException($"校验已下载的部分时服务器返回 {(int)response.StatusCode}，稍后重试", null, response.StatusCode);
+            throw new DownloadInterruptedException("远端响应读取超时", new TimeoutException("远端读取超过闲置超时", error));
         }
-        if (!validator.Matches(response)) return null;
-        var range = response.Content.Headers.ContentRange;
-        if (range?.From != sampleFrom || range.To != toPosition || range.Length is not long total)
+        catch (IOException error)
         {
-            throw new InvalidDataException("校验已下载的部分时服务器返回的 Content-Range 与请求不符，稍后重试");
+            if (cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException("下载已取消", error, cancellationToken);
+            if (error is HttpIOException && !NetworkRetry.IsTransient(error, cancellationToken))
+                throw;
+            throw new DownloadInterruptedException("远端响应读取中断", error);
         }
-        if (total <= toPosition || (validator.TotalLength is long expected && expected != total)) return null;
-
-        var remote = new byte[sampleLength];
-        await using (var body = await response.Content.ReadAsStreamAsync())
-        {
-            // 响应体提前结束时抛出 EndOfStreamException(IOException)
-            await body.ReadExactlyAsync(remote);
-        }
-        var local = new byte[sampleLength];
-        await using (var file = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-        {
-            file.Seek(-sampleLength, SeekOrigin.End);
-            await file.ReadExactlyAsync(local);
-        }
-        return remote.AsSpan().SequenceEqual(local) ? validator with { TotalLength = total } : null;
     }
 
-    private static long FileLength(string path)
+    private static async Task<HttpResponseMessage> SendMediaRequestAsync(HttpClient client,
+        HttpRequestMessage request, CancellationToken cancellationToken)
     {
-        var info = new FileInfo(path);
-        return info.Exists ? info.Length : -1;
-    }
-
-    private static HttpRequestMessage CreateMediaRequest(string url)
-    {
-        var request = new HttpRequestMessage();
-        if (!url.Contains("platform=android_tv_yst") && !url.Contains("platform=android"))
-            request.Headers.TryAddWithoutValidation("Referer", "https://www.bilibili.com");
-        request.Headers.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
-        TryAddCookieHeader(request, url);
-        request.RequestUri = new(url);
-        return request;
+        try { return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken); }
+        catch (OperationCanceledException error) when (NetworkRetry.IsTransient(error, cancellationToken))
+        {
+            // Keep true HTTP deadlines distinct from caller/peer cancellation
+            // even when an outer clip error preserves this cancellation chain.
+            throw new DownloadInterruptedException("请求媒体服务器超时", error);
+        }
     }
 
     internal static long? GetExpectedTempLength(long existingLength, long? responseContentLength)
@@ -343,6 +326,9 @@ internal static class BBDownTDownloadUtil
         {
             throw new InvalidDataException("服务器返回的 Content-Range 与请求起点不一致");
         }
+        if (contentRange.To < contentRange.From || (contentRange.Length is { } length
+            && (length <= 0 || contentRange.To >= length)))
+            throw new InvalidDataException("服务器返回的 Content-Range 超出资源范围");
 
         if (requestedTo is not null && contentRange.To != requestedTo)
         {
@@ -364,10 +350,15 @@ internal static class BBDownTDownloadUtil
         return declaredRangeLength;
     }
 
-    public static async Task DownloadFileAsync(string url, string path, DownloadConfig config)
+    public static async Task DownloadFileAsync(string url, string path, DownloadConfig config,
+        HttpClient? httpClient = null, DownloadResourceMetadata? expectedResource = null)
     {
+        config.CancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(url)) return;
+        path = OutputPathPolicy.ResolveArtifact(path, config.RestrictedOutputRoot);
+        OutputPathPolicy.ResolveArtifact(path + ".aria2", config.RestrictedOutputRoot);
         if (config.ForceHttp) url = ReplaceUrl(url);
+        var sourceObjectHash = GetSourceObjectHash(url, config);
         LogDebug("Start downloading: {0}", url);
         string desDir = Path.GetDirectoryName(path)!;
         if (!string.IsNullOrEmpty(desDir) && !Directory.Exists(desDir)) Directory.CreateDirectory(desDir);
@@ -377,28 +368,56 @@ internal static class BBDownTDownloadUtil
             Console.WriteLine();
             return;
         }
-        int retry = 0;
-        string tmpName = Path.Combine(desDir, Path.GetFileNameWithoutExtension(path) + ".tmp");
-        reDown:
-        try
+        // Audio and video paths often share a stem; include the extension.
+        string tmpName = Path.Combine(desDir, Path.GetFileName(path) + ".tmp");
+        DownloadResourceMetadata? metadata = expectedResource;
+        if (config.ResourceIdentity is not null)
         {
-            using var progress = new ProgressBar(config.RelatedTask);
-            await RangeDownloadToTmpAsync(0, url, tmpName, 0, null, (_, downloaded, total) => progress.Report((double)downloaded / total, downloaded));
-            File.Move(tmpName, path, true);
-            // 之前多线程下载合并时留下的整条轨道校验器已不再对应这个文件
-            File.Delete(path + ".resume");
+            metadata ??= await TryGetResourceMetadataAsync(url, httpClient, config.CancellationToken, config.RetryDelay,
+                sourceObjectHash is not null);
+            if (await IsCompletedTrackAsync(url, path, config, metadata))
+            {
+                config.CancellationToken.ThrowIfCancellationRequested();
+                return;
+            }
+            await SeedCompletedTrackAsync(path, tmpName, config);
         }
-        catch (Exception)
+        using var progress = new ProgressBar(config.RelatedTask);
+        var tracker = new DownloadProgressTracker(metadata?.TotalLength ?? 0,
+            [metadata?.TotalLength ?? long.MaxValue], progress.ReportDownload, message => Log(message));
+        var saved = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(tmpName + ".resume", config.RestrictedOutputRoot));
+        if (saved is not null && saved.MatchesRange(DownloadResumeState.Scope(url, config.ResourceIdentity), 0, null, metadata?.TotalLength)
+            && (metadata is null || !saved.Validator.KnownChanged(metadata.Validator)) && await saved.MatchesFileAsync(tmpName))
+            tracker.Restore(0, saved.LocalLength, !saved.MatchesSource(url, sourceObjectHash)
+                || !saved.Validator.IsUsable || (metadata is not null && !saved.Validator.Matches(metadata.Validator))
+                || new FileInfo(tmpName).Length > saved.LocalLength);
+        tracker.ReportRestored();
+        await NetworkRetry.ExecuteAsync(token => RangeDownloadToTmpAsync(0, url, tmpName, 0, null,
+            (_, _, _) => { },
+            httpClient: httpClient, restrictedOutputRoot: config.RestrictedOutputRoot,
+            resourceIdentity: config.ResourceIdentity, expectedResource: metadata,
+            retryDelay: config.RetryDelay, cancellationToken: token,
+            sourceObjectHash: sourceObjectHash, onTransferProgress: tracker.Report), NetworkRetry.DownloadDelays,
+            "下载媒体数据", config.CancellationToken, config.RetryDelay, message => LogWarn(message));
+        // Publication and local sidecar writes are deliberately outside retry.
+        config.CancellationToken.ThrowIfCancellationRequested();
+        File.Move(tmpName, path, true);
+        if (config.ResourceIdentity is not null)
         {
-            if (++retry == 3) throw;
-            goto reDown;
+            var state = await DownloadResumeState.LoadAsync(tmpName + ".resume")
+                ?? throw new InvalidDataException("完整轨道缺少续传记录");
+            await state.SaveAsync(path + ".resume", config.RestrictedOutputRoot);
         }
+        File.Delete(tmpName + ".resume");
     }
 
-    public static async Task<string[]> MultiThreadDownloadFileAsync(string url, string path, DownloadConfig config, HttpClient? httpClient = null,
-        int clipSize = DefaultClipSize)
+    public static async Task<string[]> MultiThreadDownloadFileAsync(string url, string path, DownloadConfig config, HttpClient? httpClient = null)
     {
+        config.CancellationToken.ThrowIfCancellationRequested();
+        path = OutputPathPolicy.ResolveArtifact(path, config.RestrictedOutputRoot);
+        OutputPathPolicy.ResolveArtifact(path + ".aria2", config.RestrictedOutputRoot);
         if (config.ForceHttp) url = ReplaceUrl(url);
+        var sourceObjectHash = GetSourceObjectHash(url, config);
         LogDebug("Start downloading: {0}", url);
         if (config.UseAria2c)
         {
@@ -407,11 +426,11 @@ internal static class BBDownTDownloadUtil
             Console.WriteLine();
             return [];
         }
-        long fileSize;
-        DownloadResumeValidator remote;
+        DownloadResourceMetadata metadata;
         try
         {
-            (fileSize, remote) = await ProbeRemoteFileAsync(url, httpClient);
+            metadata = await GetResourceMetadataAsync(url, httpClient, cancellationToken: config.CancellationToken,
+                retryDelay: config.RetryDelay, allowBareCdnTag: sourceObjectHash is not null);
         }
         catch (InvalidDataException ex)
         {
@@ -419,145 +438,236 @@ internal static class BBDownTDownloadUtil
             await DownloadFileAsync(url, path, new DownloadConfig
             {
                 ForceHttp = false,
-                RelatedTask = config.RelatedTask
-            });
+                RelatedTask = config.RelatedTask,
+                RestrictedOutputRoot = config.RestrictedOutputRoot,
+                ResourceIdentity = config.ResourceIdentity,
+                IsBilibiliMedia = config.IsBilibiliMedia,
+                RetryDelay = config.RetryDelay,
+                CancellationToken = config.CancellationToken,
+                MaxParallelDownloads = config.MaxParallelDownloads
+            }, httpClient);
             DeleteStaleClipFiles(path);
             return [];
         }
+        var fileSize = metadata.TotalLength;
         LogDebug("文件大小：{0} bytes", fileSize);
-        // 整条轨道上次已下载并合并完成(中断发生在下载其他轨道或混流时)：远端还是同一个文件就不再下载。
-        // 同样大小的轨道可能是另一种画质或编码，所以只认合并时留下的校验器，并抽样比对末尾字节
-        if (await IsCompleteTrackAsync(httpClient ?? AppHttpClient, url, path, fileSize, remote))
+        if (await IsCompletedTrackAsync(url, path, config, metadata))
         {
-            Log($"{Path.GetFileName(path)} 上次已下载完成，远端文件未变化，直接沿用");
-            DeleteStaleClipFiles(path);
+            config.CancellationToken.ThrowIfCancellationRequested();
+            using var cachedProgress = new ProgressBar(config.RelatedTask);
+            cachedProgress.ReportDownload(1, 0);
             return [];
         }
-        List<Clip> allClips = GetAllClips(fileSize, clipSize);
+        var trackState = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(path + ".resume", config.RestrictedOutputRoot));
+        if (trackState is { Complete: true } && trackState.MatchesRange(
+            DownloadResumeState.Scope(url, config.ResourceIdentity), 0, null)
+            && await trackState.MatchesFileAsync(path))
+        {
+            // An unrecognized source or missing validator requires full byte comparison,
+            // using a scratch copy so a failed replacement preserves the track.
+            var temporary = OutputPathPolicy.ResolveArtifact(path + ".verify.tmp", config.RestrictedOutputRoot);
+            await SeedCompletedTrackAsync(path, temporary, config);
+            using var verifiedProgress = new ProgressBar(config.RelatedTask);
+            var verifiedTracker = new DownloadProgressTracker(fileSize, [fileSize],
+                verifiedProgress.ReportDownload, message => Log(message));
+            if (trackState.TotalLength == fileSize && !trackState.Validator.KnownChanged(metadata.Validator))
+                verifiedTracker.Restore(0, trackState.LocalLength, true);
+            verifiedTracker.ReportRestored();
+            await NetworkRetry.ExecuteAsync(token => RangeDownloadToTmpAsync(0, url, temporary, 0, null,
+                (_, _, _) => { },
+                httpClient: httpClient, restrictedOutputRoot: config.RestrictedOutputRoot,
+                resourceIdentity: config.ResourceIdentity, expectedResource: metadata,
+                retryDelay: config.RetryDelay, cancellationToken: token,
+                sourceObjectHash: sourceObjectHash, onTransferProgress: verifiedTracker.Report), NetworkRetry.DownloadDelays,
+                "核验已下载轨道", config.CancellationToken, config.RetryDelay, message => LogWarn(message));
+            config.CancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporary, path, true);
+            var verified = await DownloadResumeState.LoadAsync(temporary + ".resume")
+                ?? throw new InvalidDataException("完整轨道缺少续传记录");
+            await verified.SaveAsync(path + ".resume", config.RestrictedOutputRoot);
+            File.Delete(temporary + ".resume");
+            return [];
+        }
+        List<Clip> allClips = GetAllClips(fileSize);
         var clipPaths = allClips.Select(clip => Path.Combine(Path.GetDirectoryName(path)!,
             clip.index.ToString("00000") + "_" + Path.GetFileNameWithoutExtension(path)
             + (Path.GetExtension(path).Equals(".mp4", StringComparison.OrdinalIgnoreCase) ? ".vclip" : ".aclip")))
             .ToArray();
+        if (allClips.Count > 1 && !metadata.Validator.IsUsable)
+        {
+            // Multiple independent responses without a version validator cannot
+            // establish a common snapshot. Compare the existing contiguous
+            // prefix against one full response instead of mixing generations.
+            Log("服务器未提供资源版本校验器，使用单个响应核验已有数据并续传...");
+            await SeedClipPrefixAsync(clipPaths, allClips, path + ".tmp", config.RestrictedOutputRoot);
+            await DownloadFileAsync(url, path, config, httpClient, metadata);
+            DeleteStaleClipFiles(path);
+            return [];
+        }
         int total = allClips.Count;
         LogDebug("分段数量：{0}", total);
-        // 旧版本下载完成的分片没有校验器：只有同一轨道还有分片的校验器与本次远端文件一致(说明上次下载的就是这个文件)时，
-        // 才用本次的远端校验器去校验它们(另外还要抽样比对字节)；否则重新下载
-        var legacyValidator = remote.IsUsable
-            && clipPaths.Any(clip => DownloadResumeValidator.Load(clip + ".resume")?.SameEntity(remote) == true)
-            ? remote
-            : null;
-        ConcurrentDictionary<int, long> clipProgress = new();
-        foreach (var i in allClips) clipProgress[i.index] = 0;
-
         using var progress = new ProgressBar(config.RelatedTask);
-        progress.Report(0);
-        var reusedClips = 0;
-        long reusedBytes = 0;
-        // 沿用的字节只算本次下载开始前就在磁盘上的部分，每个分片只算一次：
-        // 重试时 RangeDownloadToTmpAsync 看到的已有长度包含本次前几次尝试刚下载的字节，那些已经计入下载量
-        var initialLengths = clipPaths.Select(clip => Math.Max(0, FileLength(clip))).ToArray();
-        var reportedReuse = new long[clipPaths.Length];
-        var countedWholeClip = new bool[clipPaths.Length];
-        ClipResumeOptions ResumeFor(int index) => new()
+        var tracker = new DownloadProgressTracker(fileSize,
+            allClips.Select(clip => clip.to - clip.from + 1).ToArray(), progress.ReportDownload, message => Log(message));
+        var identity = DownloadResumeState.Scope(url, config.ResourceIdentity);
+        foreach (var clip in allClips)
         {
-            KeepValidator = true,
-            LegacyValidator = legacyValidator,
-            OnReused = (bytes, wholeClip) =>
+            config.CancellationToken.ThrowIfCancellationRequested();
+            var saved = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(
+                clipPaths[clip.index] + ".resume", config.RestrictedOutputRoot));
+            if (saved is not null
+                && saved.MatchesRange(identity, clip.from, clip.to, fileSize)
+                && !saved.Validator.KnownChanged(metadata.Validator)
+                && await saved.MatchesFileAsync(clipPaths[clip.index]))
+                tracker.Restore(clip.index, saved.LocalLength, !saved.MatchesSource(url, sourceObjectHash)
+                    || !saved.Validator.IsUsable || !saved.Validator.Matches(metadata.Validator)
+                    || new FileInfo(clipPaths[clip.index]).Length > saved.LocalLength);
+        }
+        tracker.ReportRestored();
+        using var batch = CancellationTokenSource.CreateLinkedTokenSource(config.CancellationToken);
+        IOException? firstFailure = null;
+        var parallelOptions = new ParallelOptions { CancellationToken = batch.Token };
+        if (config.MaxParallelDownloads is { } maximum) parallelOptions.MaxDegreeOfParallelism = maximum;
+        try
+        {
+            await Parallel.ForEachAsync(allClips, parallelOptions, async (clip, token) =>
             {
-                var fresh = Math.Min(bytes, initialLengths[index]) - reportedReuse[index];
-                if (fresh <= 0) return;
-                reportedReuse[index] += fresh;
-                progress.ReportReused(fresh);
-                Interlocked.Add(ref reusedBytes, fresh);
-                if (wholeClip && !countedWholeClip[index])
+                try
                 {
-                    countedWholeClip[index] = true;
-                    Interlocked.Increment(ref reusedClips);
+                    await NetworkRetry.ExecuteAsync(attemptToken => RangeDownloadToTmpAsync(clip.index, url,
+                        clipPaths[clip.index], clip.from, clip.to == -1 ? null : clip.to, (_, _, _) => { },
+                        true, httpClient, config.RestrictedOutputRoot, config.ResourceIdentity, metadata,
+                        config.RetryDelay, attemptToken, sourceObjectHash, tracker.Report), NetworkRetry.DownloadDelays, $"下载分片 {clip.index}",
+                        token, config.RetryDelay, message => LogWarn(message));
                 }
-            }
-        };
-        await Parallel.ForEachAsync(allClips, async (clip, _) =>
-        {
-            int retry = 0;
-            string tmp = clipPaths[clip.index];
-            var resume = ResumeFor(clip.index);
-            reDown:
-            try
-            {
-                await RangeDownloadToTmpAsync(clip.index, url, tmp, clip.from, clip.to == -1 ? null : clip.to, (index, downloaded, _) =>
+                catch (OperationCanceledException) when (batch.IsCancellationRequested)
                 {
-                    clipProgress[index] = downloaded;
-                    progress.Report((double)clipProgress.Values.Sum() / fileSize, clipProgress.Values.Sum());
-                }, true, httpClient, resume);
-            }
-            catch (NotSupportedException)
-            {
-                if (++retry == 3) throw new Exception($"服务器可能并不支持多线程下载, 请使用 --multi-thread false 关闭多线程");
-                goto reDown;
-            }
-            catch (Exception e)
-            {
-                if (++retry == 3) throw new Exception($"Failed to download clip {clip.index}", e);
-                LogDebug("分片 {0} 下载失败，稍后重试: {1}", clip.index, e.Message);
-                // 限流(429)、5xx 等通常过一会儿就好：稍等再试，不立刻连发
-                await Task.Delay(ClipRetryDelay * retry);
-                goto reDown;
-            }
-        });
-        if (reusedBytes > 0)
+                    throw;
+                }
+                catch (Exception error)
+                {
+                    var message = error is NotSupportedException
+                        ? "服务器可能并不支持多线程下载，请使用 --multi-thread false 关闭多线程"
+                        : $"分片 {clip.index} 下载失败：{NetworkRetry.Describe(error)}";
+                    var failure = new IOException(message, error);
+                    if (Interlocked.CompareExchange(ref firstFailure, failure, null) is null) batch.Cancel();
+                    throw failure;
+                }
+            });
+        }
+        catch
         {
-            Log($"续传：沿用了 {reusedClips} 个已下载完成的分片，共沿用已下载的 {BBDownTUtil.FormatFileSize(reusedBytes)}");
+            // ForEachAsync has awaited every worker, including uncancelled
+            // checkpoint writes. A peer's cancellation cannot hide the cause.
+            if (firstFailure is not null) ExceptionDispatchInfo.Capture(firstFailure).Throw();
+            config.CancellationToken.ThrowIfCancellationRequested();
+            throw;
         }
         return clipPaths;
     }
 
-    /// <summary>
-    /// 本地的整条轨道是否就是远端这个文件：大小相同、合并分片时留下的校验器与本次远端一致，且末尾抽样字节相同
-    /// </summary>
-    private static async Task<bool> IsCompleteTrackAsync(HttpClient client, string url, string path, long fileSize, DownloadResumeValidator remote)
-    {
-        if (FileLength(path) != fileSize) return false;
-        var saved = DownloadResumeValidator.Load(path + ".resume");
-        if (saved is null || saved.TotalLength != fileSize || !saved.SameEntity(remote)) return false;
-        // 确认远端已变化才重新下载；暂时无法确认(限流、5xx、连接中断)时稍后重试，仍不行就让这次下载失败，
-        // 不为一次网络波动把整条轨道(可能有一两个GB)重新下载一遍
-        for (var attempt = 1; ; attempt++)
-        {
-            try
-            {
-                return await ConfirmCompleteClipAsync(client, url, path, 0, fileSize - 1, saved) is not null;
-            }
-            catch (Exception e) when (attempt < 3 && e is HttpRequestException or IOException or InvalidDataException or TaskCanceledException)
-            {
-                LogDebug("校验已下载的轨道失败，稍后重试: {0}", e.Message);
-                await Task.Delay(ClipRetryDelay * attempt);
-            }
-        }
-    }
-
     internal static void MergeTrackClips(string[] files, string destination)
+        => MergeTrackClipsAsync(files, destination).GetAwaiter().GetResult();
+
+    internal static async Task MergeTrackClipsAsync(string[] files, string destination, DownloadConfig? config = null)
     {
         if (files.Length == 0) return;
-        // 合并后的整条轨道也留一个校验器：中断发生在之后下载其他轨道或混流时，再次下载可以直接沿用这条轨道
-        var trackValidator = DownloadResumeValidator.Load(files[0] + ".resume");
-        // 旧的整条轨道校验器先删掉：合并到一半中断时，不会留下旧校验器配新内容
-        File.Delete(destination + ".resume");
+        destination = OutputPathPolicy.ResolveArtifact(destination, config?.RestrictedOutputRoot);
+        OutputPathPolicy.ResolveArtifact(destination + ".resume", config?.RestrictedOutputRoot);
+        var states = new List<DownloadResumeState>();
+        foreach (var file in files)
+        {
+            OutputPathPolicy.ResolveArtifact(file, config?.RestrictedOutputRoot);
+            var state = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(
+                file + ".resume", config?.RestrictedOutputRoot));
+            if (state is null || !state.Complete || !await state.MatchesFileAsync(file))
+            {
+                if (config?.ResourceIdentity is not null) throw new InvalidDataException("分片缺少完整且有效的续传记录");
+                states.Clear();
+                break;
+            }
+            states.Add(state);
+        }
+        if (states.Count > 0)
+        {
+            long next = 0;
+            var first = states[0];
+            foreach (var state in states)
+            {
+                if (state.FromPosition != next || state.ResourceIdentity != first.ResourceIdentity
+                    || state.SourceUriHash != first.SourceUriHash || state.TotalLength != first.TotalLength
+                    || !first.Validator.SameVersionAs(state.Validator)
+                    || (config?.ResourceIdentity is not null && state.ResourceIdentity != config.ResourceIdentity))
+                    throw new InvalidDataException("分片不属于同一个轨道、范围或资源版本");
+                next += state.LocalLength;
+            }
+            if (next != first.TotalLength) throw new InvalidDataException("完整分片未覆盖整个轨道");
+        }
         BBDownTUtil.CombineMultipleFilesIntoSingleFile(files, destination);
+        if (states.Count > 0)
+        {
+            await using var stream = File.OpenRead(destination);
+            var first = states[0];
+            var completed = first with
+            {
+                FromPosition = 0, ToPosition = null, Complete = true, LocalLength = stream.Length,
+                LocalSha256 = Convert.ToHexString(await SHA256.HashDataAsync(stream))
+            };
+            await completed.SaveAsync(destination + ".resume", config?.RestrictedOutputRoot);
+        }
         foreach (var file in files)
         {
             MediaOutput.DeleteInput(file, destination);
-            File.Delete(file + ".resume");
         }
-        // 分片和它们的校验器只在合并成功前有用；之前不同大小的下载留下的多余分片也一并删除
-        DeleteStaleClipFiles(destination);
-        var length = FileLength(destination);
-        if (trackValidator is not null && length > 0 && (trackValidator.TotalLength is null || trackValidator.TotalLength == length))
+    }
+
+    private static async Task<bool> IsCompletedTrackAsync(string url, string path, DownloadConfig config,
+        DownloadResourceMetadata? metadata)
+    {
+        if (metadata is null || !metadata.Validator.IsUsable) return false;
+        var state = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(path + ".resume", config.RestrictedOutputRoot));
+        var sourceObjectHash = GetSourceObjectHash(url, config);
+        if (!(state is { Complete: true } && state.MatchesSource(url, sourceObjectHash)
+            && state.MatchesRange(DownloadResumeState.Scope(url, config.ResourceIdentity), 0, null, metadata.TotalLength)
+            && state.Validator.Matches(metadata.Validator) && await state.MatchesFileAsync(path))) return false;
+        var sourceHash = DownloadResumeState.SourceHash(url);
+        if (state.SourceUriHash != sourceHash || state.SourceObjectHash != sourceObjectHash)
+            await (state with { SourceUriHash = sourceHash, SourceObjectHash = sourceObjectHash })
+                .SaveAsync(path + ".resume", config.RestrictedOutputRoot);
+        return true;
+    }
+
+    private static string? GetSourceObjectHash(string url, DownloadConfig config)
+        => config.ResourceIdentity is null ? null : DownloadMediaSource.CreateObjectHash(url, config.IsBilibiliMedia);
+
+    private static async Task SeedCompletedTrackAsync(string path, string temporary, DownloadConfig config)
+    {
+        temporary = OutputPathPolicy.ResolveArtifact(temporary, config.RestrictedOutputRoot);
+        if (File.Exists(temporary)) return;
+        var state = await DownloadResumeState.LoadAsync(OutputPathPolicy.ResolveArtifact(path + ".resume", config.RestrictedOutputRoot));
+        if (state is not { Complete: true } || (config.ResourceIdentity is not null && state.ResourceIdentity != config.ResourceIdentity)
+            || !await state.MatchesFileAsync(path)) return;
+        OutputPathPolicy.ResolveArtifact(temporary + ".resume", config.RestrictedOutputRoot);
+        File.Copy(path, temporary);
+        await state.SaveAsync(temporary + ".resume", config.RestrictedOutputRoot);
+    }
+
+    private static async Task SeedClipPrefixAsync(string[] paths, List<Clip> clips, string temporary, string? restrictedOutputRoot)
+    {
+        temporary = OutputPathPolicy.ResolveArtifact(temporary, restrictedOutputRoot);
+        if (File.Exists(temporary)) return;
+        await using var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            262144, FileOptions.Asynchronous);
+        for (var index = 0; index < paths.Length; index++)
         {
-            (trackValidator with { TotalLength = length }).Save(destination + ".resume");
-        }
-        else
-        {
-            File.Delete(destination + ".resume");
+            var path = OutputPathPolicy.ResolveArtifact(paths[index], restrictedOutputRoot);
+            if (!File.Exists(path)) break;
+            var expected = clips[index].to - clips[index].from + 1;
+            var length = new FileInfo(path).Length;
+            if (length <= 0 || length > expected) break;
+            await using var input = File.OpenRead(path);
+            await input.CopyToAsync(output);
+            if (length < expected) break;
         }
     }
 
@@ -611,12 +721,12 @@ internal static class BBDownTDownloadUtil
     }
 
     //此函数主要是切片下载逻辑
-    internal static List<Clip> GetAllClips(long fileSize, int perSize = DefaultClipSize)
+    internal static List<Clip> GetAllClips(long fileSize)
     {
-        if (perSize <= 0) throw new ArgumentOutOfRangeException(nameof(perSize));
         List<Clip> clips = [];
         int index = 0;
         long from = 0;
+        const int perSize = 20 * 1024 * 1024;
         while (from < fileSize)
         {
             var to = Math.Min(checked(from + perSize - 1), fileSize - 1);
@@ -632,18 +742,41 @@ internal static class BBDownTDownloadUtil
         return clips;
     }
 
-    /// <summary>
-    /// 不带 Range 请求一次，只读响应头：远端文件大小，以及用来判断续传的文件是否还是同一个的校验器(ETag/Last-Modified)
-    /// </summary>
-    private static async Task<(long Size, DownloadResumeValidator Validator)> ProbeRemoteFileAsync(string url, HttpClient? httpClient = null)
+    internal static async Task<long> GetFileSizeAsync(string url, HttpClient? httpClient = null,
+        bool? international = null, Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
+        CancellationToken cancellationToken = default)
+        => (await GetResourceMetadataAsync(url, httpClient, international, retryDelay, cancellationToken)).TotalLength;
+
+    internal static async Task<DownloadResourceMetadata> GetResourceMetadataAsync(string url,
+        HttpClient? httpClient = null, bool? international = null,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null, CancellationToken cancellationToken = default,
+        bool allowBareCdnTag = false)
+        => await NetworkRetry.ExecuteAsync(token => GetResourceMetadataOnceAsync(url, httpClient, international, token, allowBareCdnTag),
+            NetworkRetry.RequestDelays, "探测媒体资源", cancellationToken, retryDelay, message => LogWarn(message));
+
+    private static async Task<DownloadResourceMetadata> GetResourceMetadataOnceAsync(string url,
+        HttpClient? httpClient, bool? international, CancellationToken cancellationToken, bool allowBareCdnTag)
     {
-        using var httpRequestMessage = CreateMediaRequest(url);
-        using var response = (await (httpClient ?? AppHttpClient).SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
+        var intl = international ?? BBDownT.Core.Config.COOKIE_IS_INTL;
+        using var httpRequestMessage = MediaRequestPolicy.CreateRequest(url, intl);
+        using var response = await SendMediaRequestAsync(httpClient ?? GetMediaHttpClient(intl),
+            httpRequestMessage, cancellationToken);
+        NetworkRetry.EnsureSuccessStatusCode(response);
         var size = GetTotalFileSize(
             response.StatusCode,
             response.Content.Headers.ContentLength,
             response.Content.Headers.ContentRange);
-        return (size, DownloadResumeValidator.FromResponse(response, size));
+        return new DownloadResourceMetadata(size, DownloadResumeValidator.FromResponse(response,
+            allowBareCdnTag || DownloadMediaSource.CreateObjectHash(url) is not null));
+    }
+
+    private static async Task<DownloadResourceMetadata?> TryGetResourceMetadataAsync(string url,
+        HttpClient? httpClient = null, CancellationToken cancellationToken = default,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null, bool allowBareCdnTag = false)
+    {
+        try { return await GetResourceMetadataAsync(url, httpClient, retryDelay: retryDelay,
+            cancellationToken: cancellationToken, allowBareCdnTag: allowBareCdnTag); }
+        catch (InvalidDataException) { return null; }
     }
 
     internal static long GetTotalFileSize(

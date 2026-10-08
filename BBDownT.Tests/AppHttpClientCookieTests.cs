@@ -12,15 +12,6 @@ namespace BBDownT.Tests;
 public class AppHttpClientCookieTests
 {
     [Fact]
-    public void Handler_DisablesTheAutomaticCookieContainer()
-    {
-        using var handler = HTTPUtil.CreateAppHttpHandler();
-
-        Assert.False(handler.UseCookies);
-        Assert.True(handler.AllowAutoRedirect);
-    }
-
-    [Fact]
     public async Task SetCookieStaysReadableButIsNeverReplayedOnLaterRequests()
     {
         await using var server = new RecordingHttpServer(index => index == 0

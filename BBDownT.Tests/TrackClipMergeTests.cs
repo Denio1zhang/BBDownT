@@ -3,7 +3,7 @@ namespace BBDownT.Tests;
 public class TrackClipMergeTests
 {
     [Fact]
-    public void UsesManifestOrderAndPreservesOtherPagesTracksAndResumeSidecars_ButDropsStaleClipsOfTheSameTrack()
+    public void UsesManifestOrderAndPreservesOtherPagesTracksAndResumeSidecars()
     {
         using var files = new MediaTestDirectory();
         var first = files.Write("00000_10.P2.200.vclip", "first");
@@ -24,8 +24,7 @@ public class TrackClipMergeTests
         Assert.Equal("P1 resume", File.ReadAllText(oldPage));
         Assert.Equal("audio resume", File.ReadAllText(audio));
         Assert.Equal("audio validator", File.ReadAllText(audioResume));
-        // 合并成功后，这条轨道之前不同大小的下载留下的多余分片已无用，一并删除(否则临时文件夹会一直显示为未完成的下载)
-        Assert.False(File.Exists(oldExtra));
+        Assert.Equal("old quality fragment", File.ReadAllText(oldExtra));
     }
 
     [Fact]

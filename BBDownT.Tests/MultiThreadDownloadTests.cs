@@ -11,6 +11,8 @@ public class MultiThreadDownloadTests
         using var files = new MediaTestDirectory();
         var destination = files.Write("track.mp4", "OLD!");
         var expectedClip = files.FilePath("00000_track.vclip");
+        files.FilePath("00000_track.vclip.resume");
+        files.FilePath("track.mp4.resume");
         var requests = new List<string>();
         using var client = new HttpClient(new Handler(request =>
         {
@@ -47,7 +49,8 @@ public class MultiThreadDownloadTests
             : throw new HttpRequestException("new resource unavailable")));
 
         await Assert.ThrowsAnyAsync<Exception>(() => BBDownTDownloadUtil.MultiThreadDownloadFileAsync(
-            "https://cdn.test/new-quality.mp4", destination, new(), client));
+            "https://cdn.test/new-quality.mp4", destination,
+            new() { RetryDelay = (_, _) => Task.CompletedTask }, client));
 
         Assert.Equal("OLD!", File.ReadAllText(destination));
     }

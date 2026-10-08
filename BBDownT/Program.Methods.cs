@@ -202,12 +202,27 @@ internal partial class Program
             || myOption.DanmakuOnly);
     }
 
+    internal static string? ValidateCoverOptions(MyOption option) => option.CoverOnly && option.SkipCover
+        ? "--cover-only 与 --skip-cover 不能同时使用" : null;
+
+    internal static async Task<bool> DownloadCoverAsync(MyOption option, string url, string path,
+        DownloadConfig config, Func<string, string, DownloadConfig, Task>? download = null)
+    {
+        if (option.SkipCover || option.OnlyShowInfo) return false;
+        await (download ?? ((source, destination, settings) => DownloadFileAsync(source, destination, settings)))(url, path, config);
+        return true;
+    }
+
+    internal static string GetCoverForMux(MyOption option, string path, Func<string, bool>? exists = null)
+        => !option.SkipCover && (exists ?? File.Exists)(path) ? path : "";
+
     /// <summary>
     /// 处理有冲突的选项
     /// </summary>
     /// <param name="myOption"></param>
     internal static void HandleConflictingOptions(MyOption myOption)
     {
+        if (ValidateCoverOptions(myOption) is { } coverError) throw new ArgumentException(coverError);
         //手动选择时不能隐藏流
         if (myOption.Interactive)
         {
@@ -235,6 +250,7 @@ internal partial class Program
             //解释环境变量
             myOption.WorkDir = Environment.ExpandEnvironmentVariables(myOption.WorkDir);
             var dir = Path.GetFullPath(myOption.WorkDir);
+            OutputPathPolicy.ResolveArtifact(dir, myOption.RestrictedOutputRoot);
             if (!Directory.Exists(dir))
             {
                 Directory.CreateDirectory(dir);
@@ -251,22 +267,24 @@ internal partial class Program
     /// <param name="myOption"></param>
     private static string? LoadCredentials(MyOption myOption)
     {
-        string? webCookieFilePath = null;
-        if (string.IsNullOrEmpty(Config.COOKIE) && File.Exists(Path.Combine(APP_DIR, "BBDownT.data")))
+        var loaded = IntlCookieStore.Load(Config.COOKIE, APP_DIR, myOption.UseIntlApi);
+        string? webCookieFilePath = loaded.FilePath;
+        if (webCookieFilePath is not null)
         {
-            Log("加载本地cookie...");
-            webCookieFilePath = Path.Combine(APP_DIR, "BBDownT.data");
+            Log(myOption.UseIntlApi ? "加载本地国际站 Cookie..." : "加载本地cookie...");
             LogDebug("文件路径：{0}", webCookieFilePath);
-            Config.COOKIE = File.ReadAllText(webCookieFilePath);
+            Config.COOKIE = loaded.Cookie;
         }
-        if (string.IsNullOrEmpty(Config.TOKEN) && File.Exists(Path.Combine(APP_DIR, "BBDownTTV.data")) && myOption.UseTvApi)
+        if (!myOption.UseIntlApi && myOption.UseTvApi && string.IsNullOrEmpty(Config.TOKEN)
+            && File.Exists(Path.Combine(APP_DIR, "BBDownTTV.data")))
         {
             Log("加载本地token...");
             LogDebug("文件路径：{0}", Path.Combine(APP_DIR, "BBDownTTV.data"));
             Config.TOKEN = File.ReadAllText(Path.Combine(APP_DIR, "BBDownTTV.data"));
             Config.TOKEN = Config.TOKEN.Replace("access_token=", "");
         }
-        if (string.IsNullOrEmpty(Config.TOKEN) && File.Exists(Path.Combine(APP_DIR, "BBDownTApp.data")) && myOption.UseAppApi)
+        if (!myOption.UseIntlApi && myOption.UseAppApi && string.IsNullOrEmpty(Config.TOKEN)
+            && File.Exists(Path.Combine(APP_DIR, "BBDownTApp.data")))
         {
             Log("加载本地token...");
             LogDebug("文件路径：{0}", Path.Combine(APP_DIR, "BBDownTApp.data"));
@@ -346,8 +364,14 @@ internal partial class Program
     /// <param name="myOption"></param>
     /// <param name="video"></param>
     /// <param name="audio"></param>
-    private static void HandlePcdn(MyOption myOption, Video? selectedVideo, Audio? selectedAudio)
+    internal static void HandlePcdn(MyOption myOption, Video? selectedVideo, Audio? selectedAudio)
     {
+        // International WEB URLs can be signed for the returned CDN host.
+        // Only an explicitly supplied host may override that choice.
+        if (myOption.UseIntlApi && string.IsNullOrEmpty(myOption.UposHost)) return;
+        if (myOption.ForceReplaceHost && string.IsNullOrEmpty(myOption.UposHost))
+            myOption.UposHost = BACKUP_HOST;
+
         if (myOption.UposHost == "")
         {
             //处理PCDN
@@ -508,15 +532,43 @@ internal partial class Program
     /// 下载轨道
     /// </summary>
     /// <returns></returns>
-    private static async Task DownloadTrackAsync(string url, string destPath, DownloadConfig downloadConfig, bool video)
+    internal static string GetTrackResumeIdentity(Page page, string apiType, string role,
+        Video? video = null, Audio? audio = null, string? variant = null)
     {
+        var fields = new[]
+        {
+            apiType, page.aid, page.cid, page.epid, role, variant ?? "",
+            video?.id ?? audio?.id ?? "", video?.codecs ?? audio?.codecs ?? "",
+            video?.res ?? "", video?.fps ?? "",
+            (video?.bandwith ?? audio?.bandwith ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture)
+        };
+        var identity = string.Concat(fields.Select(value => value.Length + ":" + value));
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+    }
+
+    internal static string GetIntlPlaybackId(VInfo info, string originalId)
+        => !string.IsNullOrEmpty(info.IntlSeasonId) && info.PagesInfo.All(page => string.IsNullOrEmpty(page.aid))
+            && originalId.StartsWith("ep:", StringComparison.Ordinal)
+            ? "intl:" + info.IntlSeasonId : originalId;
+
+    private static async Task DownloadTrackAsync(string url, string destPath, DownloadConfig downloadConfig,
+        bool video, string resourceIdentity)
+    {
+        downloadConfig = new DownloadConfig
+        {
+            UseAria2c = downloadConfig.UseAria2c, Aria2cArgs = downloadConfig.Aria2cArgs,
+            ForceHttp = downloadConfig.ForceHttp, MultiThread = downloadConfig.MultiThread,
+            RelatedTask = downloadConfig.RelatedTask, RestrictedOutputRoot = downloadConfig.RestrictedOutputRoot,
+            ResourceIdentity = resourceIdentity, IsBilibiliMedia = true
+        };
         if (downloadConfig.MultiThread && !url.Contains("-cmcc-"))
         {
             var downloadedClips = await MultiThreadDownloadFileAsync(url, destPath, downloadConfig);
             if (downloadedClips.Length > 0)
             {
                 Log($"合并{(video ? "视频" : "音频")}分片...");
-                MergeTrackClips(downloadedClips, destPath);
+                await MergeTrackClipsAsync(downloadedClips, destPath, downloadConfig);
             }
         }
         else
@@ -549,8 +601,10 @@ internal partial class Program
         if (myOption.OnlyShowInfo) return;
         try
         {
-            // 收藏夹、合集等清单里每个视频各有自己的 aid 文件夹，标题用分P(即该视频)的标题
-            var isList = vInfo.PagesInfo.Select(page => page.aid).Distinct().Count() > 1;
+            // 服务器任务：说明文件与其他产物一样不能写到下载目录外，也不能经过符号链接
+            OutputPathPolicy.ResolveArtifact(DownloadWorkFolder.MetadataPath(folder), myOption.RestrictedOutputRoot);
+            // 收藏夹、合集等清单里每个视频各有自己的工作文件夹，标题用分P(即该视频)的标题
+            var isList = vInfo.PagesInfo.Select(page => page.DownloadId).Distinct().Count() > 1;
             string? bvid = null;
             try { bvid = p.bvid; } catch (Exception) { }
             var request = relatedTask?.CurrentVideoRequest ?? DownloadHistoryRequest.From(myOption);

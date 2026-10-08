@@ -6,11 +6,34 @@ public class ConfigCredentialScopeTests : IDisposable
 {
     private readonly string originalCookie = Config.COOKIE;
     private readonly string originalToken = Config.TOKEN;
+    private readonly bool originalIntl = Config.COOKIE_IS_INTL;
 
     public void Dispose()
     {
         Config.COOKIE = originalCookie;
         Config.TOKEN = originalToken;
+        Config.COOKIE_IS_INTL = originalIntl;
+    }
+
+    [Fact]
+    public void InternationalCookieFlagIsIsolatedLikeTheCookie()
+    {
+        // 正在运行的国际站任务把全局开关设为 true：国内的解析预览不能因此改用国际站客户端、停发Cookie
+        Config.COOKIE_IS_INTL = true;
+
+        using (Config.UseCredentials("domestic", ""))
+        {
+            Assert.False(Config.COOKIE_IS_INTL);
+            using (Config.UseCredentials("intl", "", international: true))
+            {
+                Assert.True(Config.COOKIE_IS_INTL);
+                Config.COOKIE_IS_INTL = false;
+                Assert.False(Config.COOKIE_IS_INTL);
+            }
+            Assert.False(Config.COOKIE_IS_INTL);
+        }
+
+        Assert.True(Config.COOKIE_IS_INTL);
     }
 
     [Fact]

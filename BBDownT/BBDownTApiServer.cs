@@ -275,6 +275,7 @@ public partial class BBDownTApiServer
 
     internal string? ValidateAndNormalizeServerRequest(ServeRequestOptions req)
     {
+        req.RestrictedOutputRoot = null;
         if (string.IsNullOrWhiteSpace(req.Url))
         {
             return "Url不能为空";
@@ -288,6 +289,8 @@ public partial class BBDownTApiServer
         if (batchValidation is not null) return batchValidation;
         var subtitleValidation = SubtitleSelection.ValidateOptions(req);
         if (subtitleValidation is not null) return subtitleValidation;
+        var coverValidation = Program.ValidateCoverOptions(req);
+        if (coverValidation is not null) return coverValidation;
         var audioValidation = AudioLanguageSelection.ValidateOptions(req);
         if (audioValidation is not null) return audioValidation;
         if (req.Interactive && !req.OnlyShowInfo)
@@ -335,6 +338,7 @@ public partial class BBDownTApiServer
         }
 
         req.WorkDir = Path.GetFullPath(serverOptions.DownloadRoot);
+        req.RestrictedOutputRoot = req.WorkDir;
         return null;
     }
 
