@@ -380,3 +380,6 @@ BBDownT.web.json
 .env
 /data/
 /downloads/
+
+# macOS 应用打包输出（macos/build.sh）
+/macos/build/

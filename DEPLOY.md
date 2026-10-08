@@ -80,6 +80,12 @@ bbdown.example.com {
 此时可以把 `docker-compose.yml` 的端口映射改成 `"127.0.0.1:23333:23333"`，只允许通过反向代理访问。
 请保留访问令牌：未设置令牌时，服务只接受用本机地址（`127.0.0.1`、`localhost`）访问，经域名访问会返回 403。
 
+## 在 Mac 上直接用（BBDownT.app）
+
+不想用服务器、只在自己的 Mac 上用，可以下载打包好的应用：Releases 里的 `BBDownT_macOS_universal.zip`，
+或 Actions →「macOS App」每次推送的构建。双击打开就是这个网页界面，下载的文件保存在 `~/Downloads/BBDownT`。
+第一次打开的步骤（未公证应用的放行、「下载」文件夹权限）和自己打包的方法见 [macos/README.md](macos/README.md)。
+
 ## 不用 Docker
 
 也可以直接运行独立二进制（需要自行安装 ffmpeg）：
