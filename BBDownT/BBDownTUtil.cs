@@ -225,13 +225,13 @@ static partial class BBDownTUtil
     }
 
     /// <summary>
-    /// B站的网站域名：bilibili.com、bilibili.tv 及其子域(短链域名见 <see cref="IsShortLinkUri"/>)
+    /// B站的网站域名：bilibili.com 及国际站 bilibili.tv、biliintl.com，含子域(短链域名见 <see cref="IsShortLinkUri"/>)
     /// </summary>
     internal static bool IsBilibiliHost(string host)
     {
         var name = host.Trim().TrimEnd('.').ToLowerInvariant();
         static bool Under(string name, string domain) => name == domain || name.EndsWith("." + domain, StringComparison.Ordinal);
-        return Under(name, "bilibili.com") || Under(name, "bilibili.tv");
+        return Under(name, "bilibili.com") || Under(name, "bilibili.tv") || Under(name, "biliintl.com");
     }
 
     internal static bool IsShortLinkUri(string input)

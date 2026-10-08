@@ -309,6 +309,8 @@ public class VideoParseServiceTests : IDisposable
     [InlineData("https://bili.im/abc", true)]
     [InlineData("https://user@b23.tv/abc", false)]
     [InlineData("https://www.bilibili.tv/en/play/1/2", true)]
+    [InlineData("https://www.biliintl.com/en/play/34613/341736", true)]
+    [InlineData("https://biliintl.com.evil.example/en/play/1/2", false)]
     [InlineData("BV1xx411c7mD", true)]
     [InlineData("cheese/ep123", true)]
     [InlineData("https://b23.tv.evil.example/abc", false)]

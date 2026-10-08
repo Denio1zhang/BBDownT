@@ -190,7 +190,7 @@ POST /parse
 - 只使用请求里显式给出的 `Cookie`/`AccessToken`，或数据目录中保存的登录（`BBDownT.data`、`BBDownTTV.data`、`BBDownTApp.data`）；
   不借用其他任务正在使用的Cookie，也不刷新或改写登录文件（Cookie需要刷新时由下一个下载任务处理）。
 - 不支持会改写进程级设置的 `UserAgent`、`Area` 和自定义 Host（返回 `400`），解析时也不沿用其他任务设置过的 `Area`/Host；`DownloadAll`、`Interactive`、`CallBackWebHook` 等只影响下载的选项会被忽略。
-- `http(s)` 链接只接受 `bilibili.com`、`b23.tv`、`bilibili.tv` 及其子域，服务器不会代为请求其他网址。
+- `http(s)` 链接只接受 `bilibili.com`、`bilibili.tv`、`biliintl.com` 及其子域和 `b23.tv`、`bili.im` 短链，服务器不会代为请求其他网址。
 - 超时或客户端断开后，正在进行的B站请求会立即取消，名额随之释放。
 - 番剧和课程的整季信息只需一次请求，会列出全部分P（最多1000个），但音视频流只来自一个分P。
 - APP/TV 接口不使用网页扫码登录。没有对应的 access_token 时按未登录身份解析：APP 通常最高 480P，且一次只返回一种编码；TV 拿不到 1080P 及以上画质（未登录通常最高 720P）。

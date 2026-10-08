@@ -986,7 +986,7 @@ footer { text-align: center; color: var(--text-3); font-size: 12px; margin-top: 
     const path = x.pathname;
     if (host === 'b23.tv') return 'single';   // 短链由服务器展开；展开后是列表时会给出说明
     if (host === 'space.bilibili.com') return isSpaceUrl(s) ? 'space' : 'list';
-    if (!isBiliHost(host) && host !== 'bilibili.tv' && !host.endsWith('.bilibili.tv')) return 'unknown';
+    if (!isBiliHost(host) && !/(^|\.)(bilibili\.tv|biliintl\.com)$/.test(host)) return 'unknown';
     if (/\/(medialist|list)\//i.test(path) || /\/channel\/(collection|series)detail/i.test(path)) return 'list';
     if (/\/cheese\/play\/ss\d+/i.test(path)) return 'course';
     if (/\/video\/(BV1[0-9A-Za-z]{9}|av\d+)/i.test(path) || /\/(bangumi|cheese)\/play\/(ep|ss)\d+/i.test(path)

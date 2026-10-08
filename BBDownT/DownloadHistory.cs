@@ -350,7 +350,7 @@ internal static partial class DownloadHistory
     {
         if (Uri.TryCreate(url, UriKind.Absolute, out var uri)
             && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-            && IsBilibiliHost(uri.Host))
+            && (BBDownTUtil.IsBilibiliHost(uri.Host) || BBDownTUtil.IsShortLinkUri(url)))
         {
             return url;
         }
@@ -358,14 +358,6 @@ internal static partial class DownloadHistory
         if (ep is not null) return kind == "cheese" ? $"https://www.bilibili.com/cheese/play/ep{ep}" : $"https://www.bilibili.com/bangumi/play/ep{ep}";
         if (SsRegex().Match(url) is { Success: true } ss) return $"https://www.bilibili.com/bangumi/play/ss{ss.Groups[1].Value}";
         return null;
-    }
-
-    private static bool IsBilibiliHost(string host)
-    {
-        host = host.ToLowerInvariant();
-        return host is "bilibili.com" or "b23.tv" or "bilibili.tv"
-            || host.EndsWith(".bilibili.com", StringComparison.Ordinal)
-            || host.EndsWith(".bilibili.tv", StringComparison.Ordinal);
     }
 
     /// <summary>

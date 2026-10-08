@@ -54,6 +54,7 @@
     { "link": "https://www.bilibili.com/medialist/detail/ml1052622027", "expected": "list" },
     { "link": "https://www.bilibili.com/list/123?sid=1", "expected": "list" },
     { "link": "https://www.bilibili.com/festival/2021bnj", "expected": "unknown" },
+    { "link": "https://www.biliintl.com/en/play/34613/341736", "expected": "single" },
     { "link": "https://example.com/video/BV1xx411c7mD", "expected": "unknown" }
   ],
   "pagesExpr": [

@@ -132,10 +132,10 @@ internal sealed class VideoParseService(VideoParseService.Dependencies deps)
     }
 
     internal const string UnrecognizedInputMessage =
-        "无法识别的链接或编号。支持 BV/av/ep/ss/md 号、b23.tv 短链和 bilibili.com 视频、番剧、课程链接。";
+        "无法识别的链接或编号。支持 BV/av/ep/ss/md 号、b23.tv 短链、bilibili.com 视频、番剧、课程链接和 bilibili.tv、biliintl.com 国际站番剧链接。";
 
     /// <summary>
-    /// http(s) 链接只接受 bilibili.com、bilibili.tv 及其子域和 b23.tv、bili.im 短链；BV号等非链接输入交给 GetAvIdAsync 判断
+    /// http(s) 链接只接受 B站网站域名(<see cref="BBDownTUtil.IsBilibiliHost"/>)和 b23.tv、bili.im 短链；BV号等非链接输入交给 GetAvIdAsync 判断
     /// </summary>
     internal static bool IsSupportedInput(string? input)
     {
